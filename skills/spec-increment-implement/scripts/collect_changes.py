@@ -23,7 +23,7 @@ def run_git_status() -> str:
         ["git", "status", "--short"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
-    return result.stdout.strip()
+    return result.stdout.rstrip("\n")
 
 
 def format_output(git_status_output: str) -> str:
@@ -45,14 +45,13 @@ def format_output(git_status_output: str) -> str:
     deleted: list[str] = []
 
     for line in status_lines:
-        line = line.strip()
-        if not line or "?? " in line:
+        if not line:
             continue
 
-        code = line[:2].strip()
+        code = line[:2]
         path = line[3:]
 
-        if "A" in code:
+        if code == "??" or "A" in code:
             new_files.append(path)
         elif "D" in code:
             deleted.append(path)

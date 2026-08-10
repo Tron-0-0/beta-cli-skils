@@ -311,22 +311,21 @@ def run_compilation() -> CompilationReport:
     bm = BUILD_PATTERN.search(raw)
     if bm:
         status = bm.group(1)
-        if status in ("FAILURE", "ERROR"):
-            report = CompilationReport(mvn_exit_code=1)
-        else:
-            report = CompilationReport(mvn_exit_code=0)
-        return parse_issues(raw)
+        exit_code = 1 if status in ("FAILURE", "ERROR") else 0
+    else:
+        # Fallback
+        exit_code = result.returncode
 
-    # Fallback
-    report = CompilationReport(mvn_exit_code=result.returncode)
-    return parse_issues(raw)
+    report = parse_issues(raw)
+    report.mvn_exit_code = exit_code
+    return report
 
 
 def main():
     report = run_compilation()
     output = format_report(report)
     print(output)
-    sys.exit(1 if report.errors else 0)
+    sys.exit(1 if (report.errors or report.mvn_exit_code != 0) else 0)
 
 
 if __name__ == "__main__":

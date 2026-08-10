@@ -35,31 +35,34 @@ user-invocable: false
 
 | Есть файл | Следующий шаг | Скилл | Команда |
 |-----------|---------------|-------|---------|
-| Нет `intent.md` | Шаг 1 | spec-intent-generation | `/pipeline --step 1` или `/pipeline --auto` |
-| Есть `intent.md`, нет `increment.md` | Шаг 2 | spec-increment-from-task | `/pipeline --step 2` или `/pipeline --auto` |
-| Есть `increment.md`, нет `implementation-plan.md` | Шаг 3 | spec-increment-plan | `/pipeline --step 3` или `/pipeline --auto` |
-| Есть `implementation-plan.md`, нет `implementation-report.md` | Шаг 4 | spec-increment-implement | `/pipeline --step 4` или `/pipeline --auto` |
-| Есть `implementation-report.md`, нет `review-report.md` | Шаг 5 | spec-increment-review | `/pipeline --step 5` или `/pipeline --auto` |
-| Есть `review-report.md`, нет `test-report.md` | Шаг 6 | spec-increment-test | `/pipeline --step 6` или `/pipeline --auto` |
-| Есть `test-report.md` | Шаг 7 | spec-increment-actualize | `/pipeline --step 7` или `/pipeline --auto` |
+| Нет `intent.md` | Шаг 1 | spec-intent-generation | `/pipeline --step 1` |
+| Есть `intent.md`, нет `increment.md` | Шаг 2 | spec-increment-from-task | `/pipeline --step 2` |
+| Есть `increment.md`, нет `implementation-plan.md` | Шаг 3 | spec-increment-plan | `/pipeline --step 3` |
+| Есть `implementation-plan.md`, нет `implementation-report.md` | Шаг 4 | spec-increment-implement | `/pipeline --step 4` |
+| Есть `implementation-report.md`, нет `review-report.md` | Шаг 5 | spec-increment-review | `/pipeline --step 5` |
+| Есть `review-report.md`, нет `test-report.md` | Шаг 6 | spec-increment-test | `/pipeline --step 6` |
+| Есть `test-report.md` | Шаг 7 | spec-increment-actualize | `/pipeline --step 7` |
 | Всё выполнено | Финал | — | `/pipeline --status` → "✅ Pipeline завершён" |
 
 ## Шаг 0. Определить {release} и {ticket}
 
 1. Проверить аргументы `$ARGUMENTS`:
-   - Если формат `{ticket}` → `{ticket} = {ticket}`, `{release} = "01.000.02"` (default)
    - Если формат `{release}/{ticket}` → извлечь оба
-   - Если просто число → `{ticket} = PROJ-{число}`, `{release} = "01.000.02"`
-2. Если аргументов нет → определить из имени текущей ветки:
-   - Regex: `^.*-(PROJ-\d+).*` → `{ticket} = PROJ-XXX`
+   - Если формат `{ticket}` (или просто число → `{ticket} = PROJ-{число}`) → `{ticket}` определён,
+     `{release}` — перейти к п.2
+2. Если `{release}` не определён из аргументов → попытаться определить из имени текущей ветки:
+   - Regex: `^.*-(PROJ-\d+).*` → `{ticket} = PROJ-XXX` (если `{ticket}` ещё не определён)
    - Regex: `^(\d+\.\d+\.\d+)-.*` → `{release} = X.Y.Z`
-   - Default release: `"01.000.02"`
-3. Если ничего не найдено → остановиться с сообщением:
+3. Если `{ticket}` не определён ни из аргументов, ни из ветки → остановиться с сообщением:
    ```
-   ⛔ Не определены {release} и {ticket}.
-   Используйте: /pipeline PROJ-123 или /pipeline 01.000.02/PROJ-123
+   ⛔ Не определён {ticket}.
+   Используйте: /pipeline PROJ-123 или /pipeline 01.023.00/PROJ-123
    Или убедитесь, что имя ветки содержит ключ тикета (например: feature/PROJ-123-my-feature)
    ```
+4. Если `{release}` не определён — запросить у пользователя через `AskUserQuestion` или текстовым
+   сообщением "Укажите номер релиза (например, 01.023.00):". **Не подставлять значение по
+   умолчанию** — дочерние скиллы (`spec-increment-from-task`, `spec-intent-generation`) тоже
+   требуют явного релиза без дефолта, и оркестратор не должен расходиться с ними в поведении.
 
 ## Шаг 1. State machine — проверить файлы-артефакты
 
@@ -115,7 +118,7 @@ user-invocable: false
    ```
    ### Рекомендации
    1. Запустить Шаг 3: /pipeline {ticket} --step 3
-   2. Или авто-определение: /pipeline {ticket} --auto
+   2. Или запустить без флага — режим по умолчанию сам определит и выполнит этот же шаг: /pipeline {ticket}
    3. Для проверки статуса: /pipeline {ticket} --status
    ```
 
@@ -131,8 +134,14 @@ user-invocable: false
    - Шаг 5 → spec-increment-review
    - Шаг 6 → spec-increment-test
    - Шаг 7 → spec-increment-actualize
-2. Запустить выбранный скилл:
-   - Вызвать `/spec-increment-{name} {ticket}` (или `{release}/{ticket}`)
+2. Запустить выбранный скилл — фактический синтаксис вызова свой у каждого скилла, не единый шаблон:
+   - Шаг 1 → `/intent --release={release} --ticket={ticket} ...`
+   - Шаг 2 → `/increment-from-task --release={release} --ticket={ticket} ...`
+   - Шаг 3 → `/spec-increment-plan {release} {ticket}`
+   - Шаг 4 → `/spec-increment-implement {release}/{ticket}`
+   - Шаг 5 → `/spec-increment-review <базовая_ветка>`
+   - Шаг 6 → `/spec-increment-test {release} {ticket}`
+   - Шаг 7 → `/spec-increment-actualize {release}/{ticket}`
    - Или передать контекст через subagent с промптом, содержащим SKILL.md целевого скилла
 3. После выполнения → **ОСТАНОВИТЬСЯ**. НЕ проверять наличие следующего артефакта и НЕ запускать следующий шаг.
 
@@ -323,7 +332,7 @@ user-invocable: false
 
 | Ограничение | Описание | Обходной путь |
 |-------------|----------|---------------|
-| Нет auto-transition | Pipeline НЕ переходит автоматически к следующему шагу | Запускать `/pipeline --auto` каждый раз |
+| Нет auto-transition | Pipeline НЕ переходит автоматически к следующему шагу | Запускать `/pipeline {ticket}` (режим по умолчанию) заново после каждого шага |
 | Нет parallel execution | Каждый шаг выполняется последовательно | git push/pull для передачи между людьми |
 | Нет встроенной авторизации | Не проверяет, кто запускает шаг | Передача через Jira / git commit author |
 | Нет notifications | Не отправляет уведомления о завершении шага | Внешняя интеграция с Jira/Slack/email |
