@@ -3,170 +3,96 @@ apply: always
 mode: all
 ---
 
-# Соглашение: Логирование, MDC (profitcontr-objects)
+# Соглашение: Логирование, MDC
 
-**Когда читать:** При добавлении логирования, настройке MDC, или отладке проблем с логами.
+**Когда читать:** при добавлении логирования, настройке MDC, отладке проблем по логам.
 
-**Что описывает:** Logback конфигурация, MDC-контекст, уровни логирования, формат вывода.
-
-**Глобальный эталон:** `rules/09_logging.md`
+**Что описывает:** уровни логирования, структурированный вывод, MDC-корреляцию, маскирование чувствительных данных.
 
 ---
 
-<!-- source: auto -->
-## 1. Наблюдения в репозитории
+## 1. Правило
 
-### 1.1 Зависимости logging-starter и logstash-encoder
+- **SLF4J + Lombok `@Slf4j`** — единственный способ логирования; `System.out.println`/`printStackTrace` — запрещены.
+- **Параметризация сообщений** (`log.info("Order {} created", orderId)`), не конкатенация строк — конкатенация выполняется всегда, даже если уровень лога выключен, параметризация — только при активном уровне.
+- **Уровни:** `ERROR` — сбой, требующий внимания (с полным стектрейсом через `log.error("...", e)`, не только `e.getMessage()`); `WARN` — восстановимая аномалия; `INFO` — значимые бизнес-события (создание/изменение статуса сущности), не каждый шаг метода; `DEBUG` — детали для отладки, выключены в проде по умолчанию.
+- **Структурированный вывод** (JSON, например через `logstash-logback-encoder`) — для агрегации в центральном сборщике логов; человекочитаемый формат — для локальной консоли.
+- **Корреляция через MDC:** бизнес-`request-id` кладётся в MDC вручную на входе в обработку запроса (сервлет-фильтр/интерцептор) и удаляется (`MDC.clear()`) по завершении — не оставлять "утёкший" контекст между запросами на переиспользуемых потоках (thread pool). `traceId`/`spanId` из заголовка `traceparent` (см. `07_api_contract.md`) при подключённой автоинструментации (Micrometer Tracing/OpenTelemetry-агент) попадают в MDC автоматически — свой код для их проставления не нужен, ручной фильтр отвечает только за бизнес-`request-id`.
+- **MDC не наследуется при смене потока.** Переход в `@Async`-метод, отправка задачи в `ExecutorService`, `@KafkaListener`-обработчик или реактивная цепочка выполняются не в потоке, где был выставлен MDC сервлет-фильтром — контекст в новом потоке пуст, если не проставлен заново в начале обработки на этом потоке.
+- **Секреты и PII не логируются**: пароли, токены, номера карт, персональные данные — маскируются на уровне логирующего стартера/энкодера (по имени поля/заголовка) или не передаются в лог вовсе. Маскирование работает по известным полям HTTP-слоя — оно не спасает, если сущность/DTO целиком передана в лог через `toString()` (в т.ч. автогенерируемый Lombok `@ToString`): такой текст обходит маскирование и может утечь с PII внутри.
+- **Исключение логируется один раз** — там, где обрабатывается окончательно (ответ клиенту, `@RestControllerAdvice`, DLT-рекавери), либо один раз в момент трансляции в другой тип исключения с добавлением контекста, недоступного выше (пример в разделе 4); в обоих случаях выше по стеку то же событие повторно не логируется — иначе анти-паттерн "log and rethrow" превращает один сбой в несколько одинаковых стектрейсов в логе.
 
-`ru.sbrf.sbererp:logging-starter` подключён в `objects/pom.xml` (строки 104–106,
-`<artifactId>logging-starter</artifactId>`, версия через `${sbererp-starter-logging.version}`),
-а рядом заявлен `net.logstash.logback:logstash-logback-encoder` (строки 115–116).
-Это подтверждает GAP `09_logging.logging_starter`: скрипт-скан не нашёл строку
-`"logging-starter"` по ключевым паттернам, однако зависимость **фактически есть** в пом
-модуля `objects` — срабатывание ложное, стартер подтверждается.
-
-Стартер настраивается в `application.properties` через префикс `sbererp.logging.*`
-(блок `# core-common-logging-starter`): `enabled.web=${LOGGING_ENABLED_WEB:true}`,
-`enabled.feign=${LOGGING_ENABLED_FEIGN:true}`, `scope=${LOGGING_SCOPE:ALL}`,
-`masked-fields=password,creditCard,secret`, `masked-headers=Authorization,Set-Cookie`,
-`url-patterns=/api/*,/v1/*`. Уровни переопределяются переменными окружения:
-`logging.level.root=${LOG_LEVEL:INFO}` и `logging.level.org.hibernate.*`.
-
-### 1.2 Конфигурация logback-spring.xml
-
-`objects/logback-spring.xml` (путь задаётся через `logging.config=${LOGBACK_CONFIG_FILEPATH:objects/}${LOGBACK_NAME:logback-spring.xml}`):
-- **CONSOLE** — `ConsoleAppender`, человекочитаемый паттерн `log.pattern` (уровень, PID, логгер, `%m %n%wEx`).
-- **FILE** — `RollingFileAppender` в `${LOG_DIR}/log.json` (`maxFileSize=5MB`, `maxHistory=5`, `totalSizeCap=50MB`).
-- **FILE-encoder** — `net.logstash.logback.encoder.LogstashEncoder`: структурированный JSON с переопределёнными именами полей (`timestamp`, `message`, `levelStr`, `loggerName`, `thread`, `stackTrace`, `mdc`), `timestampPattern=[UNIX_TIMESTAMP_AS_STRING]`.
-- **MDC**: в `<fieldNames>` поле `mdc` объявлено, но `<includeMdc>false</includeMdc>` — MDC-контекст в JSON не выводится. Тихие логгеры (`org.hibernate.engine.transaction`, `ConsumerCoordinator`) вынесены на `INFO`; `root level=INFO`.
-
-### 1.3 Корреляционные заголовки и MDC в коде
-
-Константы заголовков заданы в
-`objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/constants/WebApplicationConstants.java`:
-`REQUEST_ID_HEADER_KEY`, `CORRELATION_ID_HEADER_KEY`, `SBERPDI_HEADER_KEY`, `RESPONSE_ID_HEADER_KEY`.
-`ObjectController` принимает `request-id`/`correlation-id`/`sberpdi` через `@RequestHeader` и
-пробрасывает их обратно заголовками ответа — но в лог/MDC эти значения **не кладутся**.
-
-Поиск `MDC.*` / `org.slf4j.MDC` по `src/main/java` дал **0 совпадений** (GAP `09_logging.mdc_usage = violation`):
-MDC-контекст в коде сервиса не используется. Вывод строк — через SLF4J Lombok-аннотацию `@Slf4j`
-(ObjectController, GlobalExceptionHandler, ServiceServiceImpl, AssetObjectServiceImpl,
-RentalObjectServiceImpl, ObjectCreationServiceImpl, OrganisationServiceImpl,
-PartnerBankAccountServiceImpl, OpenTelemetryConfig).
-
-### 1.4 Трейсинг и метрики через OpenTelemetry
-
-`objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/OpenTelemetryConfig.java`
-(`@ConditionalOnBooleanProperty("management.otlp.metrics.export.enabled")`, класс `@Slf4j` с
-`log.info("OpenTelemetry config is enabled")`) регистрирует `MeterFilter` с тегами `app/pod/stand` и
-префиксом `spring.application.ci`. Экспорт OTLP настраивается в `application.properties`
-(`management.otlp.metrics.export.url=${OPENTELEMETRY_EXPORT_URL}`) и обеспечивается
-`spring-boot-starter-opentelemetry` в `objects/pom.xml`. Трейсинг конфигурируется там же,
-MDC с trace/span id не проставляется.
-
-<!-- source: auto -->
 ## 2. Соглашения для агента
 
-- Логировать через SLF4J-`Logger`: использовать Lombok `@Slf4j` на классе —
-  это фактический стиль всех `service`/`controller`/`configuration` модуля `objects`
-  (`object/src/main/java/ru/sbrf/sbererp/profitcontr/objects/**`). Использовать параметризацию
-  `log.info("... {}", value)` и запретить конкатенацию строк и `System.out.println`.
-- Корреляционные идентификаторы (`request-id`, `correlation-id`) принимать/прокидывать
-  через константы из `WebApplicationConstants.java` (не хардкодить raw-строки в местах вызовов) —
-  образец — `ObjectController.getObjectByContractVersionId` (`@RequestHeader(CORRELATION_ID_HEADER_KEY)`).
-  Новый код должен класть эти значения в MDC в начале обработки, если требуется их видимость в логах.
-- Не логировать секреты и персональные данные: пароли, токены, данные карт (например, из
-  `accounting.env` / datasource `password`). Для HTTP-полей и заголовков использовать
-  маскирование стартера — `sbererp.logging.masked-fields=password,creditCard,secret`,
-  `sbererp.logging.masked-headers=Authorization,Set-Cookie` в `application.properties`.
-- Поддерживать структурированный формат: изменения в `logback-spring.xml` должны сохранять
-  `LogstashEncoder` для FILE-аппендера и не ломать поля (`timestamp`, `levelStr`, `stackTrace`, `mdc`).
-- Общие требования (уровни, язык сообщений, URL-паттерны) применять по глобальному
-  `rules/09_logging.md` в `core-gigacode-skills` — локально поверх него конкретизируется только
-  фактическая конфигурация репозитория.
+- Логируй через `@Slf4j` с параметризацией; не добавляй логирование в горячих циклах на уровне `INFO` — это создаёт шум и деградирует производительность при высокой нагрузке.
+- Корреляционные идентификаторы клади в MDC в начале обработки запроса (фильтр/интерцептор), очищай в `finally`; не полагайся на то, что каждый разработчик вручную прокидывает `request-id` в каждый `log.info`.
+- Если в сервисе уже подключена трассировка (Micrometer Tracing/OpenTelemetry) — не заводи свой MDC-код для `traceId`/`spanId`, они проставляются автоинструментацией; ручной MDC-код нужен только для бизнес-`request-id`, специфичного для сервиса.
+- В обработчиках, выполняющихся на отдельном потоке (`@Async`, задачи в `ExecutorService`, `@KafkaListener`), — явно проставляй нужный MDC-контекст в начале обработки; не полагайся на то, что он унаследован из потока, где был выставлен сервлет-фильтром.
+- Исключения — логируй с объектом исключения (`log.error("Failed to process order {}", orderId, e)`), не только сообщением — стектрейс обязателен для диагностики.
+- Не добавляй `log.error(..., e)` в `catch`, если исключение пробрасывается дальше **без изменений** — это задваивает запись в логе, когда оно будет залогировано выше. Логировать в момент проброса допустимо только при трансляции в другой тип исключения с добавлением контекста (пример — `OrderServiceImpl` в разделе 4); в этом случае выше по стеку новый тип исключения повторно не логируется.
+- Не логируй тела запросов/ответов целиком без фильтрации полей — используй маскирование чувствительных полей на уровне логирующего интерцептора; не подменяй его логированием `entity`/DTO целиком через `toString()` (`log.info("{}", order)`) — маскирование по полям на такой текст не действует.
+- Не логируй на уровне `DEBUG` то, что должно быть `INFO` (значимые бизнес-события) — и наоборот, не засоряй `INFO` техническими деталями.
 
-<!-- source: auto -->
 ## 3. Чек-лист
 
-- [ ] Логгер — через `@Slf4j` (Lombok), сообщения параметризованы (`{}`), без конкатенации строк и `System.out.println`
-- [ ] Уровни соответствуют конвенции: ERROR — сбои, WARN — recoverable, INFO — бизнес-события
-- [ ] Критичные исключения логируются со стеком (`log.error("Ошибка", e)`), а не только `e.getMessage()`
-- [ ] Секреты и персональные данные не попадают в лог; маскирование поля/заголовки настроены в `application.properties`
-- [ ] Корреляционные заголовки read/reply через константы `WebApplicationConstants` (`REQUEST_ID_HEADER_KEY`, `CORRELATION_ID_HEADER_KEY`)
-- [ ] Формат логов совместим с `logstash-logback-encoder` (FILE-аппендер в `logback-spring.xml`)
-- [ ] Новый MDC-код проставляет контекст в начале обработки и удаляет после (`MDC.remove`), при необходимости — с включением `<includeMdc>true</includeMdc>`
+- [ ] Логирование — только `@Slf4j`, без `System.out`/`printStackTrace`
+- [ ] Сообщения параметризованы, без конкатенации
+- [ ] Исключения логируются со стеком, не только с `getMessage()`
+- [ ] `request-id` в MDC проставляется на входе запроса и очищается после
+- [ ] MDC явно проставляется в начале обработки на каждом отдельном потоке (async/executor/Kafka-листенер), не только во входном HTTP-фильтре
+- [ ] Секреты/PII не попадают в лог; маскирование настроено на уровне конфигурации
+- [ ] Сущности/DTO не логируются целиком через `toString()`/`@ToString` — только явно перечисленные поля
+- [ ] Исключение логируется один раз — при окончательной обработке или в момент трансляции в другой тип с контекстом, не задваивается при простом пробросе
+- [ ] Уровни логов соответствуют конвенции (ERROR/WARN/INFO/DEBUG)
+- [ ] Формат вывода — структурированный JSON для агрегатора логов, пишется в stdout/stderr (см. `10_cloud_native.md`)
 
-<!-- source: auto -->
-## 4. Примеры из кода
-
-### Example 1: ObjectsClientAutoConfiguration.java
-**Путь:** `objects-rest-client/src/main/java/ru/sbrf/sbererp/profitcontr/objects/client/configuration/ObjectsClientAutoConfiguration.java`
-
-```java
-@AutoConfiguration
-@EnableFeignClients(
-        basePackageClasses = ObjectsClient.class
-)
-public class ObjectsClientAutoConfiguration {
-}
-```
-
-Автоконфигурация Feign-клиента; входящие/исходящие HTTP-запросы клиента логируются
-стартером `logging-starter` (`sbererp.logging.enabled.feign=true`), без ручного MDC.
-
-### Example 2: OpenTelemetryConfig.java (лог на старте)
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/OpenTelemetryConfig.java`
+## 4. Примеры кода
 
 ```java
-@Slf4j
-@ConditionalOnBooleanProperty("management.otlp.metrics.export.enabled")
-@Configuration
-@RequiredArgsConstructor
-public class OpenTelemetryConfig {
+@Component
+public class CorrelationIdFilter extends OncePerRequestFilter {
 
-    @PostConstruct
-    void init() {
-        log.info("OpenTelemetry config is enabled");
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        // бизнес-request-id, не trace-id: при подключённой трассировке traceId/spanId уже в MDC от инструментации
+        String requestId = Optional.ofNullable(request.getHeader("X-Request-Id"))
+                .orElseGet(() -> UUID.randomUUID().toString());
+        MDC.put("requestId", requestId);
+        try {
+            response.setHeader("X-Request-Id", requestId);
+            chain.doFilter(request, response);
+        } finally {
+            MDC.clear();
+        }
     }
 }
 ```
 
-Пример использования `@Slf4j` + `log.info(...)` без конкатенации — канонический стиль
-логирования в модуле `objects`; конфигурация трейсинга через `spring-boot-starter-opentelemetry`.
+```java
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class OrderServiceImpl implements OrderService {
 
-### Example 3: logback-spring.xml (Logstash-encoder, FILE)
-**Путь:** `objects/logback-spring.xml`
+    public Order createOrder(OrderCreateRequest request) {
+        log.info("Creating order for customer {}", request.customerId());
+        try {
+            return doCreate(request);
+        } catch (DataIntegrityViolationException e) {
+            log.error("Failed to create order for customer {}", request.customerId(), e);
+            throw new OrderCreationException(e);
+        }
+    }
+}
+```
 
 ```xml
 <encoder class="net.logstash.logback.encoder.LogstashEncoder">
-    <fieldNames>
-        <timestamp>timestamp</timestamp>
-        <message>message</message>
-        <level>levelStr</level>
-        <thread>threadName</thread>
-        <mdc>mdc</mdc>
-    </fieldNames>
-    <includeMdc>false</includeMdc>
+    <includeMdcKeyName>requestId</includeMdcKeyName>
 </encoder>
 ```
 
-Структурированный JSON-вывод в `${LOG_DIR}/log.json`; поле `mdc` объявлено, но не заполняется
-(`includeMdc=false`) — согласуется с отсутствием MDC-кода в `src/main/java`.
+## 5. Когда пересматривать
 
-<!-- source: auto -->
-## 5. Исключения и оговорки
-
-Соглашение по MDC носит характер **открытой зоны**: в текущем коде MDC не используется
-(GAP `09_logging.mdc_usage = violation`, проверка по `src/main/java` дала count=0).
-До внедрения MDC-кода корреляция в логах не проставляется автоматически — для отладки
-полагаться на `request-id`/`correlation-id` на уровне HTTP-заголовков и логи стартера.
-При первом добавлении MDC обновить `logback-spring.xml` (`<includeMdc>true</includeMdc>`),
-иначе MDC-поля в JSON-логах не появятся.
-
-<!-- source: auto -->
-## 6. Обновление
-
-Пересобирать при смене логирующего стека (обновление версии `sbererp-starter-logging.version`
-или `logstash-logback-encoder` в `objects/pom.xml`), изменении аппендеров/полей в
-`logback-spring.xml`, либо при первом внедрении MDC-кода (включение `includeMdc`, добавление
-соответствующих `MDC.put/remove` в слои `service`/`controller`).
+При смене логирующего стека/энкодера, при подключении автоматической трассировки (Micrometer Tracing/OpenTelemetry — меняется состав того, что проставляется в MDC вручную), либо при инциденте из-за утечки чувствительных данных в лог.

@@ -3,119 +3,103 @@ apply: always
 mode: all
 ---
 
-# Соглашение: Unit и интеграционные тесты (profitcontr-objects)
+# Соглашение: Unit- и интеграционные тесты
 
-**Когда читать:** При написании тестов, настройке тестовой инфраструктуры, или выборе типа теста.
+**Когда читать:** при написании тестов, настройке тестовой инфраструктуры, выборе типа теста.
 
-**Что описывает:** Unit-тесты, интеграционные тесты, тестовые профили, MockMvc, Embedded Kafka/DB.
-
-**Глобальный эталон:** `rules/06_unit_tests_with_spring_context.md`
+**Что описывает:** пирамиду тестов, unit vs slice vs интеграционные тесты, инструменты, именование.
 
 ---
 
-<!-- source: auto -->
-## 1. Наблюдения в репозитории
+## 1. Правило
 
-### 1.1 Тестовые зависимости и инструменты (pom + JaCoCo)
+- **Пирамида тестов:** много быстрых unit-тестов (сервисы, мапперы — без Spring-контекста), меньше slice-тестов (`@WebMvcTest`, `@DataJpaTest` — часть контекста), минимум полных интеграционных (`@SpringBootTest`, поднимают весь контекст — медленные, оставляют для критичных сквозных сценариев).
+- **Unit-тесты сервисов/мапперов** — `@ExtendWith(MockitoExtension.class)`, зависимости через `@Mock`, объект под тестом — `@InjectMocks`. Без поднятия Spring-контекста.
+- **Интеграционные тесты с БД** — Testcontainers с реальной СУБД, а не H2/встроенная in-memory база: H2 расходится с продовой СУБД в диалекте SQL, типах данных и поведении блокировок — тесты могут проходить на H2 и падать в проде (и наоборот).
+- **`@DataJpaTest` по умолчанию сам подставляет embedded-БД** (`@AutoConfigureTestDatabase`) поверх любого datasource, заданного через Testcontainers/`@DynamicPropertySource`. С Testcontainers обязателен `@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)` — иначе тест молча переключается на H2 в обход контейнера, нарушая правило выше, при этом тест остаётся зелёным.
+- **MapStruct-мапперы** — инстанцируются напрямую (`Mappers.getMapper(...)`) в unit-тестах, без контекста.
+- **Контроллеры** — `@WebMvcTest` (slice) с замоканным сервисным слоем, либо чистый Mockito-тест на класс контроллера, если запросы не проверяются на уровне HTTP/сериализации.
+- **Именование** — `<method>_<condition>_<expectedResult>()` (`createOrder_whenDuplicateKey_throwsConflict`). Тест-класс — `<Class>Test`, интеграционный — `<Class>IT` (отдельный от unit по соглашению сборки, если интеграционные тесты гоняются отдельным профилем/фазой).
+- **`@DisplayName`** — необязательное, но рекомендуемое дополнение к техническому имени метода: читаемое описание сценария и ожидаемого результата на тестовом классе и на каждом методе. Не заменяет именование по правилу выше, а дублирует его смысл в человекочитаемой форме.
+- **Группировка `@Nested`** — если для одного метода тестируемого класса набирается больше двух тестов, группируй их во вложенный `@Nested`-класс (например, `OrderServiceImplTest.CreateOrder`) со своим `@DisplayName`, а не держи все тесты плоским списком в одном классе.
+- **Структура теста** — Given/When/Then (или Arrange/Act/Assert), один логический сценарий на тест; ассерты — через AssertJ (`assertThat(...)`), не голый JUnit `assertEquals` для сложных объектов.
 
-- В `objects/pom.xml` подключён только `org.springframework.boot:spring-boot-starter-test` (`<scope>test</scope>`, строка 54). На его основе в сервисе используются JUnit 5 (`org.junit.jupiter`), Mockito, AssertJ, MapStruct-реализации.
-- В корневом `pom.xml` настроен JaCoCo: плагин `org.jacoco:jacoco-maven-plugin` с целями `prepare-agent` (перед тестами) и `report` (фаза `test`); общий блок `sonar.coverage.exclusions` пуст. SonarQube включён через `sonar.java.coveragePlugin=jacoco`, `sonar.projectKey=CI06228014:CI15418320`.
-- Профиль `mutation-testing` (Pitest, цель `mutationCoverage` в фазе `verify`) описан в корневом `pom.xml`; прогоняется отдельно: `mvn verify -Pmutation-testing`.
-- **Актуальные тест-классы** (21 файл в `objects/src/test/java`) полагаются только на Mockito/AssertJ — без `@SpringBootTest`, `@WebMvcTest`, `@DataJpaTest`, Testcontainers (`grep` по `**/test/**` не дал ни одного вхождения этих аннотаций).
-
-### 1.2 Структура тестов по слоям (parallel `src/test/java`)
-
-Тесты лежат в `objects/src/test/java/ru/sbrf/sbererp/profitcontr/objects/` **зеркально** пакетам `src/main/java`:
-
-- **Смоук / вход:** `WebApplicationTest.java` (чёрный вызов `WebApplication.main`, статический мок через `MockedStatic`).
-- **Сервисные impl** (`service/object/impl/`): `ObjectCreationServiceImplTest.java`, `ServiceServiceImplTest.java`, `AssetObjectServiceImplTest.java`, `RentalObjectServiceImplTest.java`.
-- **MDM-сервисы** (`service/mdm/impl/`): `OrganisationServiceImplTest.java`, `PartnerBankAccountServiceImplTest.java`.
-- **MapStruct-мапперы request (`configuration/mapper/request/`):** `creation/ServiceCreateRequestToEntityMapperTest.java`, `asset/AssetObjectCreateRequestToEntityMapperTest.java`, `request/mdm/MdmBankAccountToBankAccountMapperTest.java`, `request/mdm/MDMPartnerToPartnerMapperTest.java`.
-- **MapStruct-мапперы response (`configuration/mapper/response/`):** `ServiceToServiceResponseMapperTest.java`, `AssetObjectToAssetObjectDTOMapperTest.java`, `CapObjectToCapObjectResponseMapperTest.java`, `FinapObjectToFinapObjectDTOMapperTest.java`, `OrganisationToOrganisationDTOMapperTest.java`, `PartnerToPartnerResponseMapperTest.java`, `RentalObjectToRentalObjectDTOMapperTest.java`.
-- **Контроллер:** `ObjectControllerTest.java` (чистый Mockito на `ObjectController`, без `@WebMvcTest`).
-
-> Примечание: `bundle.rules["06"].layer_stats.test = 1` учитывает только один файл (голден-сэмпл `WebApplicationTest.java`) из-за фильтрации `views/layers.py`, поэтому фактических тест-классов 21, а не 1. Структуру подтверждает полный glob `objects/src/test/java/**/*.java`.
-
-### 1.3 Отсутствие Spring-контекста и интеграционных сценариев
-
-- Во всех тестах используется `@ExtendWith(MockitoExtension.class)` с `@Mock` / `@Spy` / `@InjectMocks` либо plain JUnit 5.
-- **НЕ ОПРЕДЕЛЕНО:** `@SpringBootTest`, slice-тесты (`@WebMvcTest` / `@DataJpaTest`), `*IT*.java`, `@MockitoBean/@MockitoSpyBean`, H2/Testcontainers, `src/test/resources/application.yml`, каталоги `src/test/resources/request` и `src/test/resources/response/{success,error}` из эталона в репозитории отсутствуют.
-- **Отклонение от глобального `rules/06`:** эталон предписывает поднятие Spring-контекста, MockMvc и embedded H2, тогда как в сервисе для сервисов, мапперов и контроллера принят **чистый unit-тест без контекста** (моки одиночных зависимостей). Возможна регрессия risk: смоук только на `WebApplication.main`.
-
-<!-- source: auto -->
 ## 2. Соглашения для агента
 
-- **Размещай тест в parallel-каталоге** `objects/src/test/java/ru/sbrf/sbererp/profitcontr/objects/<package>` строго по пакету тестируемого класса из `src/main/java` (см. §1.2).
-- **Именуй тест-класс по суффиксу слоя:** `*ServiceImplTest` для `service/**/impl/*Service.java`, `*MapperTest` для `configuration/mapper/**/*Mapper.java`, `*ControllerTest` для `controller/*Controller.java`, `WebApplicationTest` — для точки входа.
-- **Для сервисов и контроллера используй `@ExtendWith(MockitoExtension.class)`** с `@Mock` (зависимости и репозитории) и `@InjectMocks` — без поднятия Spring-контекста, так как это фактический стиль репо (см. `ObjectCreationServiceImplTest.java`, `ObjectControllerTest.java`).
-- **Для MapStruct-мапперов инстанцируй маппер** через `org.mapstruct.factory.Mappers.getMapper(XxxMapper.class)`; проверяй поля `assertThat(...).usingRecursiveComparison()` и кейсы с `null`-значениями.
-- **Mocking внешних MapStruct-мапперов** внутри сервисных тестов — через `@Spy` + `Mappers.getMapper(...)`, а не `@Mock`, если сервис реально вызывает маппер (пример: `ServiceServiceImplTest.java`).
-- **Начинай новый интеграционный/смоук-тест с `@SpringBootTest`, если требуется контекст;** в текущем репо таких тестов нет — при добавлении первых `@SpringBootTest` дополни `src/test/resources/application.yml` и опиши слоистую настройку среды (иначе риск падения из-за внешних зависимостей/БД).
+- Новый тест размещай в `src/test/java` зеркально пакету тестируемого класса.
+- Для сервисов/мапперов — `MockitoExtension` без Spring-контекста, если тест не требует реальной транзакции/JPA-поведения.
+- Тест репозитория/JPA-слоя — через `@DataJpaTest` + Testcontainers с `@AutoConfigureTestDatabase(replace = Replace.NONE)`, не через полный `@SpringBootTest`, если не нужен весь контекст целиком. `@SpringBootTest` — только когда тесту реально нужны несколько слоёв/полный контекст, а не H2 вместо Testcontainers.
+- Тестовые данные — через builder/factory-методы (`createOrderRequest()`), не инлайновый хардкод в каждом тесте — снижает дублирование и упрощает изменение схемы данных.
+- Мокай только внешние границы (репозитории, клиенты других сервисов); не мокай классы из того же модуля, которые можно использовать напрямую — иначе тест проверяет моки, а не поведение.
+- Параметризуй тесты (`@ParameterizedTest` + `@MethodSource`/`@CsvSource`) при проверке одной логики на разных входных данных вместо копипасты похожих тестов.
+- Добавляй `@DisplayName` на класс и методы теста в дополнение к техническому имени; когда для одного метода тестируемого класса появляется третий тест — группируй все его тесты в `@Nested`-класс, а не оставляй плоский список.
 
-<!-- source: auto -->
 ## 3. Чек-лист
 
-- [ ] Unit-тест использует правильный слайс (`@WebMvcTest`, `@DataJpaTest`) **или** `@ExtendWith(MockitoExtension.class)` — в текущем репо принят последний вариант для service/mapper/controller
-- [ ] Интеграционный тест аннотирован `@SpringBootTest` с нужным профилем **и** добавлен `src/test/resources/application.yml` (сейчас таких тестов в репо нет — первое добавление требует этой настройки)
-- [ ] Моки внешних зависимостей через `@MockitoBean` / `@MockitoSpyBean` (в текущей устоявшейся практике — `@Mock`/`@Spy` + `@InjectMocks` через `MockitoExtension`)
-- [ ] Тестовые данные создаются через Builder/фабричные методы (в тестах — `createXxxRequest()`, `createServiceEntity()`, `createOrganisation()`), не инлайном хардкода в каждом тесте
-- [ ] Именование: `<Method>_<condition>_<expectedResult>()` (пример: `createObject_withUnknownProcessType_shouldThrowIllegalArgument`)
-- [ ] Русские `@DisplayName("...")` на тесте и классе для читаемости отчётов (стиль всех текущих тестов)
-- [ ] Для мапперов проверены null/пустые значения и свежесть экземпляра (`usingRecursiveComparison()`)
-- [ ] Ожидаемые тела ответов для HTTP-проверок лежат в `src/test/resources/response/{success,error}` после перехода на MockMvc/интеграционные тесты
-- [ ] В тесты не попадают реальные credentials/пароли из `accounting.env` (файл содержит рабочие DB/keystore-секреты и находится в `.gitignore`)
+- [ ] Unit-тест сервиса/маппера не поднимает Spring-контекст без необходимости
+- [ ] Интеграционный тест с БД использует Testcontainers, а не H2
+- [ ] Slice-тест (`@DataJpaTest` и т.п.) с Testcontainers использует `@AutoConfigureTestDatabase(replace = Replace.NONE)`
+- [ ] Тестовые данные создаются через builder/factory, не хардкодом в каждом тесте
+- [ ] Именование методов — `<method>_<condition>_<expectedResult>`
+- [ ] `@DisplayName` — на тестовом классе и методах; тесты одного метода (>2) сгруппированы в `@Nested`
+- [ ] Замокано только то, что действительно является внешней границей
+- [ ] Похожие сценарии с разными входными данными — параметризованы, а не продублированы
+- [ ] Ассерты — через AssertJ, с читаемым сообщением на сложных сравнениях
 
-<!-- source: auto -->
-## 4. Примеры из кода
-
-### Example 1: ObjectCreationServiceImplTest.java
-**Путь:** `objects/src/test/java/ru/sbrf/sbererp/profitcontr/objects/service/object/impl/ObjectCreationServiceImplTest.java`
-
-Чистый unit-тест сервисного impl без Spring-контекста: `@ExtendWith(MockitoExtension.class)`, `@Mock` зависимости сервисов, `@InjectMocks ObjectCreationServiceImpl`; русский `@DisplayName`; верификация через `verify(...)`/`verifyNoInteractions(...)`.
+## 4. Примеры кода
 
 ```java
 @ExtendWith(MockitoExtension.class)
-@DisplayName("ObjectCreationServiceImpl")
-class ObjectCreationServiceImplTest {
+@DisplayName("OrderCreationServiceImpl")
+class OrderCreationServiceImplTest {
 
-    @Mock private RentalObjectService rentalObjectService;
-    @Mock private AssetObjectService assetObjectService;
-    @Mock private ServiceService serviceService;
-    @InjectMocks private ObjectCreationServiceImpl service;
+    @Mock private OrderRepository orderRepository;
+    @InjectMocks private OrderCreationServiceImpl service;
 
-    @Test
-    @DisplayName("createObject — неизвестный код процесса — IllegalArgumentException")
-    void createObject_withUnknownProcessType_shouldThrowIllegalArgument() {
-        assertThatThrownBy(() -> service.createObject(request))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("999");
-        verify(serviceService).checkExistObjectsForContractVersionId(CONTRACT_VERSION_ID);
-        verifyNoInteractions(rentalObjectService, assetObjectService);
-    }
-}
-```
+    @Nested
+    @DisplayName("Создание заказа")
+    class CreateOrder {
 
-### Example 2: WebApplicationTest.java
-**Путь:** `objects/src/test/java/ru/sbrf/sbererp/profitcontr/objects/WebApplicationTest.java`
+        @Test
+        @DisplayName("бросает IllegalArgumentException при отсутствии customerId")
+        void createOrder_whenCustomerIdMissing_throwsIllegalArgument() {
+            var request = createOrderRequest(builder -> builder.customerId(null));
 
-Смоук-тест точки входа через статический мок `MockedStatic`; `@DisplayName("Main тест")` на русском. Единственный тест-класс, который трогает `main`.
+            assertThatThrownBy(() -> service.createOrder(request))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("customerId");
 
-```java
-@ExtendWith(MockitoExtension.class)
-class WebApplicationTest {
-
-    @Test
-    @DisplayName("Main тест")
-    void main() {
-        try (MockedStatic<WebApplication> mockedStatic = mockStatic(WebApplication.class)) {
-            WebApplication.main(new String[]{});
-            mockedStatic.verify(() -> WebApplication.main(new String[]{}));
+            verifyNoInteractions(orderRepository);
         }
     }
 }
 ```
 
-<!-- source: auto -->
-## 5. Исключения и оговорки
+```java
+@DataJpaTest
+@Testcontainers
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+class OrderRepositoryIT {
 
-- Соглашение §2 про `@ExtendWith(MockitoExtension.class)` **не заменяет** интеграционного тестирования, требуемого глобальным регламентом `rules/06`. Если сценарий требует Spring-контекста (репозитории с БД, Feign-клиенты, полный слой MVC), добавляй `@SpringBootTest`/slice-тест и `src/test/resources/application.yml` — в текущей кодовой базе таких примеров ещё нет (`НЕ ОПРЕДЕЛЕНО`).
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16");
+
+    @DynamicPropertySource
+    static void datasourceProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+    }
+
+    @Autowired private OrderRepository orderRepository;
+
+    @Test
+    void findByCustomerId_returnsPersistedOrders() {
+        orderRepository.save(anOrder().customerId(CUSTOMER_ID).build());
+
+        assertThat(orderRepository.findByCustomerId(CUSTOMER_ID)).hasSize(1);
+    }
+}
+```
+
+## 5. Когда пересматривать
+
+При смене тестового стека (например, переход на JUnit 6), введении первого `@SpringBootTest` в проекте без такой практики ранее, либо при систематических расхождениях H2/прод-СУБД.

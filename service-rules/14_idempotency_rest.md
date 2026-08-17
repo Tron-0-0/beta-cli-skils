@@ -3,166 +3,90 @@ apply: always
 mode: all
 ---
 
-<!-- source: auto -->
-# Соглашение: Идемпотентность REST-запросов (profitcontr-objects)
+# Соглашение: Идемпотентность REST-запросов
 
-**Когда читать:** При реализации идемпотентных REST-эндпоинтов или настройке стартера идемпотентности.
+**Когда читать:** при реализации мутирующих REST-эндпоинтов, ретраях клиентов, защите от дублей.
 
-**Что описывает:** @Idempotency, core-common-web-idempotency-starter, ключи web.idempotency.*.
-
-**Глобальный эталон:** `rules/14_idempotency_rest.md`
+**Что описывает:** заголовок `Idempotency-Key`, хранилище идемпотентности, идемпотентность по натуральному ключу.
 
 ---
 
-<!-- source: auto -->
-## 1. Наблюдения в репозитории
+## 1. Правило
 
-### 1.1 Стартер `core-common-web-idempotency-starter` в pom.xml НЕ подключён
+- **Идемпотентность нужна там, где клиент может повторить запрос** — сетевой таймаут не означает, что запрос не выполнился на сервере; клиент, не получивший ответ, обязан иметь возможность безопасно повторить `POST`/`PATCH`.
+- **`GET`/`PUT`/`DELETE` идемпотентны по HTTP-семантике** сами по себе (при корректной реализации) — заголовок `Idempotency-Key` нужен именно для `POST`/`PATCH`, создающих или частично меняющих состояние не идемпотентным по умолчанию способом.
+- **Механизм — атомарная резервация ключа, не read-then-write.** Сервер должен атомарно застолбить `Idempotency-Key` перед выполнением операции (`SETNX`/аналог в кеше, либо уникальный констрейнт на колонку в БД) и только затем выполнять операцию и сохранять результат. Обычный `get` (ключа нет) → выполнить → `put` — гонка: два конкурентных запроса с одним ключом оба не находят сохранённый результат и оба выполняют операцию, что и должна была предотвращать идемпотентность.
+- **Конкурентный повтор до завершения первой операции** — отдельный случай от "уже выполнено": если ключ зарезервирован, но результат ещё не сохранён (первый запрос всё ещё выполняется), повторный запрос с тем же ключом не ждёт молча и не выполняет операцию параллельно — возвращает `409 Conflict` (или аналогичный признак "уже в работе").
+- **Ключ скоупится операцией**, не используется "как есть" в общем пространстве ключей — `Idempotency-Key` уникален в рамках конкретного эндпоинта/типа операции у клиента, но два разных эндпоинта с одинаковым значением заголовка не должны разделять один слот в хранилище (`operation:key`, не голый `key`).
+- **Один ключ — одна бизнес-операция.** Один и тот же `Idempotency-Key` не переиспользуется для разных запросов/полезной нагрузки — если тело запроса с тем же ключом отличается от первого — это ошибка клиента (`422`/`409`), а не повторный запрос.
+- **Отсутствующий обязательный `Idempotency-Key`** на эндпоинте, для которого он часть контракта (см. `07_api_contract.md`), — `400`, а не тихое выполнение операции без защиты от дублей.
+- **Альтернатива/дополнение — идемпотентность по натуральному ключу**: если у бизнес-операции есть естественный уникальный идентификатор (номер заказа, версия договора), уникальный констрейнт/проверка на существование записи с этим ключом перед вставкой защищает от дублей даже без явного `Idempotency-Key`.
+- **TTL хранилища идемпотентности** — ограничен разумным окном повтора (минуты-часы, не бессрочно) — идемпотентность защищает от ретраев клиента, а не является журналом операций навсегда.
 
-Файл: `objects/pom.xml`. Среди зависимостей блока `<dependencies>` отсутствует
-`ru.sbrf.sbererp.common:core-common-web-idempotency-starter` (поиск `idempotency`/`Idempotency` — 0 совпадений).
-Стек integration ограничен REST/OpenFeign (`spring-cloud-starter-openfeign`, `objects-rest-client`).
-Аннотация `@Idempotency` в `src/main/java` не встречается ни на одном контроллере.
-
-TODO-блоки также подтверждают, что стартер **только задекларирован в конфиге, но не подключён**
-(см. 1.3) — реального механизма идемпотентности через starter в репо нет.
-
-### 1.2 Мутирующий эндпоинт POST без защиты `@Idempotency`
-
-Файл: `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/controller/ObjectController.java`.
-Метод `createObject` (`@PostMapping`, возвращает `201 Created`) — единственный мутационный эндпоинт сервиса.
-В сигнатуре метода читаются только `request-id`, `correlation-id`, `sberpdi`
-(`@RequestHeader(REQUEST_ID_HEADER_KEY / CORRELATION_ID_HEADER_KEY / SBERPDI_HEADER_KEY)`), аннотации
-`@Idempotency` нет, заголовок `idempotency-key` в `createObject` не читается.
-
-### 1.3 Константа `idempotency-key` определена, но не используется
-
-Файл: `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/constants/WebApplicationConstants.java`.
-Определена константа `IDEMPOTENCY_ID_HEADER_KEY = "idempotency-key"` (строка 18), однако она не задействована
-ни в `ObjectController`, ни в `ObjectControllerDocs`, ни в swagger-документации — это подготовка к будущему
-включению idempotency, а не действующая механика.
-
-### 1.4 Закомментированный блок `web.idempotency.*` в application.properties
-
-Файл: `objects/src/main/resources/application.properties`, строки 71–82 (комментарий `# core-common-web-idempotency-starter`).
-Все настройки закомментированы префиксом `#` и содержат значения по умолчанию из env:
-`web.idempotency.enabled=${WEB_IDEMPOTENCY_ENABLED:true}`, `ttl=1h`, `cacheable-statuses=200,201`,
-`redis.*` (addresses/node-name/connection-* / redis-*). Это описывает ожидаемую конфигурацию стартера,
-**но не активная** — при `spring.config.activate.on-profile` блок выключен, т.к. закомментирован.
-Статус: заготовка под включение стартера, реальной idempotency нет.
-
-### 1.5 Естественно-ключевая проверка на дубликат есть — `ObjectsAlreadyExistException`
-
-Файлы:
-- `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/exception/ObjectsAlreadyExistException.java`
-- `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/service/object/impl/ServiceServiceImpl.java` (`checkExistObjectsForContractVersionId`)
-- `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/service/object/impl/ObjectCreationServiceImpl.java` (`@Transactional createObject`)
-
-Создание объекта идемпотентно по **натуральному ключу `contractVersionId`**: `ObjectCreationServiceImpl.createObject`
-начинает с `serviceService.checkExistObjectsForContractVersionId(request.getContractVersionId())`, которая ищет
-`serviceRepository.findByContractVersionId` и при непустом результате бросает `ObjectsAlreadyExistException`
-(«Объекты аренды для версии договора с id … уже созданы»). Это прикладной механизм защиты от повторного
-создания через версию договора — аналог idempotency без стартера.
-
----
-
-<!-- source: auto -->
 ## 2. Соглашения для агента
 
-- Обеспечивать идемпотентность **новых** мутационных эндпоинтов (`POST`) двумя механизмами: заголовком
-  `idempotency-key` (константа `IDEMPOTENCY_ID_HEADER_KEY` в
-  `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/constants/WebApplicationConstants.java`)
-  **и** прикладной проверкой существующей записи по натуральному ключу (пример — `checkExistObjectsForContractVersionId`
-  в `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/service/object/impl/ServiceServiceImpl.java`),
-  чтобы повторный `POST` возвращал существующий объект/`409 Conflict` без создания дублей.
+- На новом мутирующем эндпоинте (`POST`/`PATCH`, создающем побочный эффект) — принимай `Idempotency-Key` из заголовка; если ключ уже видели — возвращай сохранённый результат, не выполняй операцию повторно; если заголовок обязателен, но отсутствует — `400`.
+- Резервируй ключ атомарно перед выполнением операции (`putIfAbsent`/уникальный констрейнт), не проверяй наличие результата отдельным `get` перед выполнением — это гонка при конкурентных повторах.
+- Ключ храни/сравнивай в связке с идентификатором операции (`operation:key`), не как голое значение заголовка — иначе разные эндпоинты с одинаковым значением ключа от клиента разделят один слот в хранилище.
+- Дополняй (не заменяй) идемпотентность прикладной проверкой на дубликат по натуральному ключу перед записью, если такой ключ есть в домене.
+- Не используй один и тот же `Idempotency-Key` для нескольких разных операций в клиентском коде.
+- Секреты/адреса хранилища идемпотентности (Redis и т.п.) — через переменные окружения, не хардкод (см. `12_configuration.md`).
+- На `GET` идемпотентность не реализуется — она не нужна: повторный `GET` безопасен по определению.
 
-- **Использовать натуральный ключ** как основу идемпотентности для операций создания объекта: как
-  `contractVersionId` уже гарантирует уникальность (сущность версии контракта). Сверять повторный `POST`
-  по `request.getContractVersionId()` до вставки, а не полагаться только на idempotency-ключ.
-
-- **Применять аннотацию `@Idempotency`** (если стартер будет подключён) только на мутационные эндпоинты
-  (`POST`/`PATCH`), как `createObject` в `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/controller/ObjectController.java`,
-  и **не** на GET-запросы.
-
-- **Не использовать один `idempotency-key` для разных бизнес-операций** — каждый уникальный `Idempotency-Key`
-  соответствует одной бизнес-операции (один `contractVersionId`), согласно `rules/14_idempotency_rest.md`.
-
-- **Секреты Redis** настраивать только через переменные окружения / Vault, а не в `application.properties`.
-   В репо блок `web.idempotency.redis.*` (строки 75–82 `application.properties`) закомментирован и содержит
-   значения по умолчанию — не активировать их без реальной потребности.
-
-- **При закомментированном свойстве `web.idempotency.enabled`** — не включать стартер без реальной потребности:
-   сейчас стартер и аннотация отсутствуют (см. §1.2), идемпотентность реализуется на уровне приложения через
-   `ObjectsAlreadyExistException`. Если потребность в Redis-idempotent появится — добавить зависимость
-   `core-common-web-idempotency-starter` в `objects/pom.xml` и раскомментировать блок `web.idempotency.*`
-   (без значений/паролей Redis в репо).
-
----
-
-<!-- source: auto -->
 ## 3. Чек-лист
 
-- [ ] Зависимость `core-common-web-idempotency-starter` присутствует в `pom.xml` (сейчас **отсутствует** — если нужна Redis-idempotency, добавить по образцу `rules/14_idempotency_rest.md`)
-- [ ] Контроллеры с мутирующими операциями (POST/PUT/PATCH) аннотированы `@Idempotency`
-- [ ] Ключи `web.idempotency.*` настроены в `application*.yml` (имена ключей; в репо заблокированы в `application.properties`, строки 71–83)
-- [ ] TTL и стратегия хранения ключей idempotency задокументированы
-- [ ] Повторные вызовы возвращают тот же результат без побочных эффектов
-- [ ] Прикладная проверка существования по натуральному ключу (`checkExistObjectsForContractVersionId`) выполняется **до** записи в transaction, чтобы повторный `POST` не плодил дубли
-- [ ] Константа `idempotency-key` (`IDEMPOTENCY_ID_HEADER_KEY`) фактически используется в контроллере, а не только объявлена в `WebApplicationConstants.java`
+- [ ] Мутирующие эндпоинты (`POST`/`PATCH` с побочным эффектом) принимают `Idempotency-Key`
+- [ ] Отсутствие обязательного `Idempotency-Key` — явная ошибка `400`, не молчаливое выполнение без защиты
+- [ ] Резервация ключа — атомарная операция (`putIfAbsent`/уникальный констрейнт), не `get` + `put` раздельно
+- [ ] Конкурентный повторный запрос с тем же ключом, пока первый ещё выполняется, — `409`, не параллельное выполнение
+- [ ] Ключ в хранилище скоупится операцией/эндпоинтом, не голым значением заголовка
+- [ ] Повторный запрос с тем же ключом после завершения не выполняет операцию повторно и возвращает тот же результат
+- [ ] Разное тело запроса с тем же ключом — явная ошибка, а не тихая перезапись
+- [ ] Есть дополнительная защита по натуральному ключу домена, если он существует
+- [ ] TTL хранилища идемпотентности ограничен разумным окном
+- [ ] `GET` не оснащён избыточным механизмом идемпотентности
 
----
-
-<!-- source: auto -->
-## 4. Примеры из кода
-
-### Example 1: POST-создание объекта в контроллере (без `@Idempotency` на текущий момент)
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/controller/ObjectController.java`
+## 4. Примеры кода
 
 ```java
-@ObjectControllerDocs.CreateObjectDocs
 @PostMapping
-public ResponseEntity<ObjectsCreationResponse> createObject(
-        @RequestBody @Valid ObjectCreateRequest objectCreateRequest,
-        @RequestHeader(value = REQUEST_ID_HEADER_KEY) UUID requestId,
-        @RequestHeader(value = CORRELATION_ID_HEADER_KEY) UUID correlationId,
-        @RequestHeader(value = SBERPDI_HEADER_KEY) String sberId
-) {
-    return ResponseEntity.status(HttpStatus.CREATED)
-            .header(RESPONSE_ID_HEADER_KEY, requestId.toString())
-            .body(objectCreationService.createObject(objectCreateRequest));
+public ResponseEntity<OrderResponse> createOrder(
+        @RequestBody @Valid OrderCreateRequest request,
+        @RequestHeader(IDEMPOTENCY_KEY_HEADER) String idempotencyKey) {
+    return idempotencyService.executeOnce("orders:create", idempotencyKey, () -> orderService.createOrder(request));
 }
 ```
-Создаётся объект; заголовок `idempotency-key` пока не читается — при развитии добавить
-`@RequestHeader(IDEMPOTENCY_ID_HEADER_KEY)`.
-
-### Example 2: сервис создания с прикладной проверкой уникальности по версии договора
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/service/object/impl/ObjectCreationServiceImpl.java`
-и `ServiceServiceImpl.java`
 
 ```java
-@Override
-@Transactional
-public ObjectsCreationResponse createObject(ObjectCreateRequest request) {
-    serviceService.checkExistObjectsForContractVersionId(request.getContractVersionId());  // -> ObjectsAlreadyExistException
+public <T> ResponseEntity<T> executeOnce(String operation, String key, Supplier<T> action) {
+    String scopedKey = operation + ":" + key;                        // ключ, скоупленный операцией — не голое значение заголовка
+
+    boolean reserved = cache.putIfAbsent(scopedKey, IN_PROGRESS);    // атомарная резервация, не отдельные get+put
+    if (!reserved) {
+        var existing = cache.get(scopedKey);
+        if (existing.isInProgress()) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).build(); // тот же ключ уже выполняется конкурентно
+        }
+        return ResponseEntity.status(existing.status()).body((T) existing.body());
+    }
+
+    T result = action.get();
+    cache.put(scopedKey, CachedResult.completed(HttpStatus.CREATED, result), Duration.ofHours(24));
+    return ResponseEntity.status(HttpStatus.CREATED).body(result);
+}
+```
+
+Дополнительная защита по натуральному ключу:
+
+```java
+public void createOrder(OrderCreateRequest request) {
+    if (orderRepository.existsByExternalReference(request.externalReference())) {
+        throw new OrderAlreadyExistsException(request.externalReference());
+    }
     ...
 }
-
-// ServiceServiceImpl:
-public void checkExistObjectsForContractVersionId(UUID contractVersionId) {
-    if (!serviceRepository.findByContractVersionId(contractVersionId).isEmpty()) {
-        throw new ObjectsAlreadyExistException(String.format(
-                "Объекты аренды для версии договора с id %s уже созданы", contractVersionId));
-    }
-}
 ```
-Естественный ключ `contractVersionId` защищает от повторного создания — прикладная идемпотентность без стартера.
 
-<!-- source: auto -->
-## 5. Исключения и оговорки
+## 5. Когда пересматривать
 
-- Сейчас idempotent-стартер **не подключён** и `@Idempotency` не используется — рекомендация ограничивает
-  локальный прикладной механизм (`ObjectsAlreadyExistException`), не требуя немедленного ввода Redis.
-- Если появится требование включить `core-common-web-idempotency-starter` (blocking MVC, Redis Sentinel,
-  заголовок `Idempotency-Key`), следует раскомментировать блок `web.idempotency.*` с реальными значениями
-  через env, добавить аннотацию `@Idempotency` на `createObject` и перечитать глобальный эталон
-  `rules/14_idempotency_rest.md`.
+При смене хранилища идемпотентности, изменении TTL-политики, или при обнаружении дублей/гонок в проде (в т.ч. от конкурентных повторов с одним и тем же ключом), не покрытых текущим механизмом.

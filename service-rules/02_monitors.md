@@ -3,115 +3,80 @@ apply: always
 mode: all
 ---
 
-<!-- source: auto -->
-# Соглашение: Мониторинг и метрики (profitcontr-objects)
+# Соглашение: Мониторинг и метрики
 
-**Когда читать:** При настройке мониторинга, добавлении бизнес-метрик, или проверке health/readiness-эндпоинтов.
+**Когда читать:** при настройке мониторинга, добавлении бизнес-метрик, проверке health/readiness-эндпоинтов.
 
-**Что описывает:** Actuator, Micrometer/OTLP, Eskibi/MeterFilter, health/readiness probes, custom-метрики и custom-HealthIndicator.
-
-**Глобальный эталон:** `rules/02_monitors.md`
+**Что описывает:** Spring Boot Actuator, Micrometer, health/readiness probes, кастомные метрики и health-индикаторы.
 
 ---
 
-<!-- source: auto -->
-## 1. Наблюдения в репозитории
+## 1. Правило
 
-### 1.1 Стек мониторинга (модуль `objects`)
+- **Actuator обязателен** для сервисов, работающих в оркестрируемом окружении: `spring-boot-starter-actuator` подключён, открыты как минимум `health`, `info`, `metrics`. Чувствительные endpoints (`env`, `beans`, `heapdump`, `threaddump`) в проде либо не публикуются вовсе, либо доступны только через отдельный management-порт (`management.server.port`), закрытый снаружи кластера — открытие их на публичном порту в проде — угроза утечки конфигурации и секретов.
+- **Метрики экспортируются** через Micrometer в единый бэкенд (Prometheus/OTLP/StatsDB) — не собственным форматом.
+- **Health vs Readiness — раздельные группы.** `liveness` и `readiness` конфигурируются как отдельные Actuator health-groups (`management.endpoint.health.group.*`); readiness обычно включает кастомные `HealthIndicator` внешних зависимостей, liveness — только `livenessState`. Семантику различия и её роль в деплое/оркестрации см. в `10_cloud_native.md` — здесь фиксируется только то, как это выражается через конфигурацию Actuator.
+- **Бизнес-метрики** регистрируются через `MeterRegistry` (`Counter`/`Timer`/`Gauge`), а не через парсинг логов.
+- **Кардинальность тегов** — теги метрик не должны содержать значения с неограниченной кардинальностью (ID пользователя, timestamp, UUID запроса) — это взрывает объём хранимых метрик на бэкенде. Допустимые теги: тип операции, статус, код ошибки, имя эндпоинта.
 
-Мониторинг построен на Spring Boot Actuator + Micrometer c экспортом метрик по OTLP. В `objects/src/main/resources/application.properties`:
-
-- `management.endpoints.web.exposure.include=startup,health,info,metrics,env` — открыты основные Actuator-эндпоинты;
-- `management.endpoint.health.probes.enabled=true` и `management.endpoint.startup.enabled=true` — включены liveness/readiness/startup-пробы.
-
-Зависимости (`objects/pom.xml`): `spring-boot-starter-actuator`, `micrometer-registry-otlp`, `spring-boot-starter-opentelemetry`, `feign-micrometer`.
-
-### 1.2 Конфигурация OTLP-экспорта
-
-Параметры вынесены в переменные окружения (`objects/src/main/resources/application.properties`):
-
-```properties
-management.otlp.metrics.export.url=${OPENTELEMETRY_EXPORT_URL}
-management.otlp.metrics.export.batchSize=15000
-management.otlp.metrics.export.aggregationTemporality="DELTA"
-management.otlp.metrics.export.step=30s
-management.otlp.metrics.export.enabled=${OPENTELEMETRY_ENABLED:true}
-```
-
-### 1.3 Обогащение метрик через MeterFilter
-
-`OpenTelemetryConfig` (`objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/OpenTelemetryConfig.java`, `@ConditionalOnBooleanProperty("management.otlp.metrics.export.enabled")`) регистрирует `MeterFilter`, который добавляет префикс CI к имени метрики и теги `app`, `pod`, `stand`:
-
-```java
-id.withName(String.format("%s.%s", ci, id.getName().replace('.', '_')))
-        .withTags(Tags.of(
-                Tag.of("app", appName),
-                Tag.of("pod", POD_NAME),
-                Tag.of("stand", STAND)));
-```
-
-### 1.4 GAP: кастомные бизнес-метрики и HealthIndicator не обнаружены
-
-- `02_monitors.custom_metrics`: partial — в `src/main/java` нет использования `MeterRegistry` / `Counter` / `Timer` / `Gauge` (count=0). Бизнес-метрик в коде нет.
-- `02_monitors.custom_health`: partial — нет классов `HealthIndicator` / `AbstractHealthIndicator` (count=0). Кастомных health-индикаторов нет.
-
-Модуль `objects-rest-client` (библиотека Feign-клиент) не содержит Actuator/Micrometer и не требует метрик — его `pom.xml` включает только `spring-cloud-starter-openfeign`, `lombok`, `spring-boot-autoconfigure`, `ssl-context-starter`, swagger и jackson.
-
-<!-- source: auto -->
 ## 2. Соглашения для агента
 
-- Новые бизнес-метрики (счётчики, таймеры, gauges) регистрируй через `io.micrometer.core.instrument.MeterRegistry` (`Counter`, `Timer`, `Gauge`). Это соответствует глобальному `rules/02_monitors.md` (micrometer-registry-otlp) и привязано к `objects/src/main/java` — кастомных метрик пока нет, но конфигурация экспорта уже готова.
-- Кастомные проверки состояния выноси в отдельные классы, реализующие `HealthIndicator` / наследовавшие `AbstractHealthIndicator`. Используй готовые пробы liveness/readiness (`management.endpoint.health.probes.enabled=true` в `application.properties`) — не дублируй их вручную.
-- Бизнес-метрики обогащай через существующий `MeterFilter` в `OpenTelemetryConfig` (теги `app` / `pod` / `stand` и префикс CI) — не создавай второй фильтр с другим набором тегов.
-- Трассировку и метрики выводи через OTLP-экспорт (`management.otlp.metrics.export.*` в `application.properties`); параметры URL выноси в `${OPENTELEMETRY_EXPORT_URL}` без хардкода адресов.
-- Не записывай в метрики, теги и health-детали значения секретов, паролей и персональных данных — как это исключено из `application.properties` и регламентом.
+- Новые счётчики/таймеры/gauge регистрируй через инъекцию `MeterRegistry`; имя метрики — `dot.case`, сегменты от общего к частному (`orders.created`, `orders.processing.duration`), в едином стиле с уже существующими метриками сервиса — не смешивай `dot.case` и `snake_case` в рамках одного сервиса.
+- Кастомные проверки состояния — отдельные классы `HealthIndicator`, каждый проверяет ровно одну зависимость (БД, внешний API, очередь); индикаторы readiness-зависимостей перечисляй в `management.endpoint.health.group.readiness.include`, не добавляй их в liveness.
+- Вызовы внешних систем внутри `health()` — с ограниченным таймаутом (переиспользуй клиент с уже настроенными таймаутами, не создавай отдельный без ограничения). Индикатор без таймаута может подвесить весь health-check пода при деградации зависимости, а не просто отрапортовать `DOWN`.
+- Не проставляй в теги метрик и в детали `HealthIndicator` значения секретов, персональных данных или полных URL с credentials.
+- Экспорт (адрес коллектора, batch size, шаг) конфигурируй через переменные окружения (`${OTLP_EXPORT_URL}`), не хардкодь адреса.
 
-<!-- source: auto -->
 ## 3. Чек-лист
 
-- [ ] `spring-boot-starter-actuator` подключён и нужные endpoints (`startup,health,info,metrics,env`) доступны
-- [ ] Micrometer-зависимость присутствует: `micrometer-registry-otlp` и `spring-boot-starter-opentelemetry` в `objects/pom.xml`
-- [ ] OTLP-экспорт настроен в `application.properties` (`management.otlp.metrics.export.*` через `${OPENTELEMETRY_EXPORT_URL}`)
-- [ ] Liveness/readiness пробы включены (`management.endpoint.health.probes.enabled=true`)
-- [ ] Новые бизнес-метрики зарегистрированы через `MeterRegistry` (`Counter`/`Timer`/`Gauge`), а не через лог или поле
-- [ ] Теги метрики соответствуют существующему `MeterFilter` из `OpenTelemetryConfig` (app/pod/stand, префикс CI)
-- [ ] Кастомные HealthIndicator (если есть) покрывают критические зависимости и не содержат секретов в detail
-- [ ] Логирование метрик не дублирует данные Actuator
-- [ ] После правок перегенерированы сгенерированные классы и проверено покрытие тестами
+- [ ] `spring-boot-starter-actuator` подключён, чувствительные endpoints (`env`, `beans`, `heapdump`, `threaddump`) не открыты публично в проде
+- [ ] Micrometer-registry настроен на реальный бэкенд метрик
+- [ ] Liveness и readiness — раздельные health-groups, readiness включает кастомные `HealthIndicator` внешних зависимостей
+- [ ] Новые бизнес-метрики — через `MeterRegistry`, имя в `dot.case`, без тегов высокой кардинальности
+- [ ] Внешние вызовы внутри кастомных `HealthIndicator` ограничены таймаутом
+- [ ] Кастомные `HealthIndicator` не содержат секретов в `Health.Builder.withDetail(...)`
+- [ ] Адреса экспорта метрик — из переменных окружения
 
-<!-- source: auto -->
-## 4. Примеры из кода
-
-### Example 1: OpenTelemetryConfig.java — обогащение метрик
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/OpenTelemetryConfig.java`
+## 4. Примеры кода
 
 ```java
-@Bean
-public MeterFilter nameConfigFilter() {
-    return new MeterFilter() {
-        @Override
-        public Meter.@NonNull Id map(Meter.@NonNull Id id) {
-            return id.withName(String.format("%s.%s", ci, id.getName().replace('.', '_')))
-                    .withTags(Tags.of(
-                            Tag.of("app", appName),
-                            Tag.of("pod", POD_NAME),
-                            Tag.of("stand", STAND)));
-        }
-    };
+@Component
+@RequiredArgsConstructor
+public class OrderMetrics {
+    private final MeterRegistry registry;
+
+    public void recordCreated(OrderStatus status) {
+        registry.counter("orders.created", "status", status.name()).increment();
+    }
 }
 ```
 
-### Example 2: OTLP-экспорт из application.properties
-**Путь:** `objects/src/main/resources/application.properties`
+```java
+@Component
+@RequiredArgsConstructor
+public class PaymentGatewayHealthIndicator implements HealthIndicator {
+    private final PaymentGatewayClient client;
 
-```properties
-management.otlp.metrics.export.url=${OPENTELEMETRY_EXPORT_URL}
-management.otlp.metrics.export.step=30s
-management.otlp.metrics.export.enabled=${OPENTELEMETRY_ENABLED:true}
-management.endpoint.health.probes.enabled=true
-management.endpoints.web.exposure.include=startup,health,info,metrics,env
+    @Override
+    public Health health() {
+        try {
+            client.ping(); // клиент сконфигурирован с connect/read-таймаутом — health() не блокируется на зависшем соединении
+            return Health.up().build();
+        } catch (Exception e) {
+            return Health.down().withDetail("reason", e.getMessage()).build();
+        }
+    }
+}
 ```
 
-<｜DSML｜tool_calls>
-<｜DSML｜invoke name="edit">
-<｜DSML｜parameter name="file_path" string="true">C:\Work\profitcontr-objects\.gigacode\service-rules\parts\gap_notes.jsonl
+```properties
+management.endpoints.web.exposure.include=health,info,metrics
+# management.server.port=8081   — опция: вынести все actuator-endpoints на отдельный порт вместо точечного отключения
+management.endpoint.health.probes.enabled=true
+management.endpoint.health.group.readiness.include=readinessState,paymentGateway
+management.otlp.metrics.export.url=${OTLP_EXPORT_URL}
+```
+
+## 5. Когда пересматривать
+
+При смене бэкенда метрик, добавлении новых внешних зависимостей, требующих readiness-проверки, изменении политики раскрытия Actuator-эндпоинтов, или изменении границы ответственности с `10_cloud_native.md` по семантике probes.

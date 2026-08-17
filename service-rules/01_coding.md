@@ -3,207 +3,321 @@ apply: always
 mode: all
 ---
 
-<!-- source: auto -->
-# Соглашение: Слои, стиль кода, соглашения (profitcontr-objects)
+# Соглашение: Слои, стиль кода, соглашения
 
-**Когда читать:** При написании нового кода, рефакторинге, или code review — особенно при добавлении сервисов, контроллеров, MapStruct-мапперов и JPA-сущностей.
+**Когда читать:** при написании нового кода, рефакторинге, code review — сервисы, контроллеры, мапперы, сущности.
 
-**Что описывает:** Слои приложения, DI-паттерн (интерфейс+impl), constructor injection через Lombok, Lombok/MapStruct конвенции, Swagger-контракт через `ObjectControllerDocs`.
-
-**Глобальный эталон:** `rules/01_coding.md`
+**Что описывает:** слои приложения, DI, Lombok/MapStruct, SOLID, паттерны проектирования, enum vs константы, null-safety, именование, комментарии/Javadoc, импорты, форматирование вызовов и кода, изменяемость DTO.
 
 ---
 
-<!-- source: auto -->
-## 1. Наблюдения в репозитории
+## 1. Правило
+
+### 1.0 Общий принцип
+
+Перед тем как писать новый класс — найди в проекте структурно похожий существующий (для сервиса — другой `*ServiceImpl`, для маппера — существующий MapStruct-интерфейс, для контроллера — соседний `*Controller`) и повтори его пакет, аннотации, стиль. Не изобретай новый стиль по памяти об общих конвенциях Spring там, где в проекте уже есть представитель этого же слоя — расхождение стиля между однотипными классами дороже в поддержке, чем локальная неоптимальность выбранного однажды паттерна.
 
 ### 1.1 Слои и структура пакетов
 
-Сервис — Java 21 / Spring Boot 3 (SberERP), пакет по умолчанию `ru.sbrf.sbererp.profitcontr.objects`. В `objects/src/main/java` присутствуют слои (по `facts/scan.json` → `layers`):
+Стандартное разбиение по техническим слоям внутри доменного пакета:
 
-- `service/object` + `service/object/impl` — сервисы типов объектов: `ObjectCreationService.java`, `ServiceService.java`, их реализации `*ServiceImpl` (`ServiceServiceImpl.java`, `AssetObjectServiceImpl.java`, `RentalObjectServiceImpl.java`, `ObjectCreationServiceImpl.java`).
-- `service/mdm` + `service/mdm/impl` — MDM-сервисы: `OrganisationService.java`, `PartnerBankAccountService.java`, реализации `OrganisationServiceImpl.java`, `PartnerBankAccountServiceImpl.java`.
-- `controller` — `ObjectController.java` как единственный `@RestController`; `controller/swagger/ObjectControllerDocs.java` — Swagger-аннотации.
-- `configuration/mapper/request` и `configuration/mapper/response` — MapStruct-мапперы; базовый конфиг `configuration/mapper/StrictMapperConfiguration.java`.
-- `model/entity` — JPA-сущности (`Service`, `RentalObject`, `AssetObject`, `CapObject`, `FinapObject`, `Organisation`, `Partner`, `BankAccount`); `model/enums` — `ObjectTypeName`, `RentalObjectStatusName`, `ObjectTypeByClassification`.
-- `repository/` — Spring Data: `ServiceRepository`, `AssetObjectRepository`, `RentalObjectRepository`.
+- `controller/` — REST-контроллеры, тонкие; `controller/swagger/` — если Swagger-документация вынесена в отдельные аннотации, а не в интерфейсы `*Api`.
+- `service/` + `service/impl/` — интерфейс сервиса и реализация с суффиксом `Impl`. Интерфейс на границе слоя оправдан, когда есть >1 реализация, тестовый мок через интерфейс или сервис пересекает границу модуля; для простого CRUD-сервиса без альтернативных реализаций интерфейс — не обязателен, класс с бизнес-логикой допустим напрямую.
+- `repository/` — Spring Data репозитории.
+- `mapper/` (или `configuration/mapper/`) — MapStruct-мапперы, разделены по направлению (`request/`, `response/`) при большом числе мапперов.
+- `model/entity/` — JPA-сущности; `model/enums/` — доменные `enum`; `model/dto/` — DTO, если не вынесены в отдельный клиентский модуль.
+- `exception/` — доменные исключения + `@RestControllerAdvice`.
+- `config/` (или `configuration/`) — бины конфигурации, автоконфигурации.
 
-Границы вызовов: `controller` → `service` → `repository`; мапперы (`configuration/mapper`) используются сервис-слоем, контроллер остаётся thin (только валидация `@Valid` + делегирование + заголовки). Заметных слоёв Kafka нет (слой `kafka` пуст); Feign-клиент вынесен в модуль `objects-rest-client` (слой `client`).
+Границы вызовов: `controller` → `service` → `repository`. Контроллер и репозиторий не вызывают друг друга напрямую, минуя сервис.
 
-### 1.2 DI и Lombok: constructor injection
+### 1.2 DI: только constructor injection
 
-Во всех прочитанных impl-классах (`OrganisationServiceImpl.java`, `ServiceServiceImpl.java`) используется constructor injection через `@RequiredArgsConstructor` + `private final` поля и `@Service`. `@Autowired` не используется.
+- Зависимости — `private final` поля + `@RequiredArgsConstructor` (Lombok) либо явный конструктор. `@Autowired` на полях — запрещено: усложняет тестирование, скрывает обязательность зависимости, допускает циклические зависимости, которые Spring не всегда обнаруживает.
+- Если у класса больше 7 `private final` зависимостей — это сигнал разделить класс по ответственности (SRP), а не подключать `@Autowired`/сеттер-инъекцию.
+- Опциональные зависимости — через `Optional<T>` в конструкторе или `@ConditionalOnBean`, не через `@Autowired(required = false)`.
 
-Пример — `service/object/impl/ServiceServiceImpl.java`:
+### 1.3 Lombok: где использовать, где нет
 
-```java
-@Slf4j
-@org.springframework.stereotype.Service
-@RequiredArgsConstructor
-public class ServiceServiceImpl implements ServiceService {
-    private final ServiceRepository serviceRepository;
-    private final ServiceToServiceDtoMapper serviceDtoMapper;
-    private final OrganisationToOrganisationDtoMapper organisationMapper;
-```
+- **DTO/record-кандидаты** — предпочитай `record` для неизменяемых DTO (Java 17+), либо `@Value @Builder` (Lombok) если нужен билдер/JSON-десериализация с `@Jacksonized`. Избегай `@Data` на DTO — он генерирует мутабельные сеттеры там, где объект должен быть неизменяемым после создания.
+- **JPA-сущности** — `@Getter`/`@Setter` точечно, не `@Data`: `@Data` генерирует `equals`/`hashCode` по всем полям, что ломается на ленивых JPA-связях (StackOverflow, N+1 при сравнении) и на неинициализированном ID. Для сущностей `equals`/`hashCode` определяй по бизнес-ключу или суррогатному ID, либо не переопределяй вовсе и полагайся на identity.
+- **Билдеры на сущностях** — `@Builder` допустим, но не должен заменять инварианты конструктора (обязательные поля не должны позволять `build()` без них — используй `@Builder` с explicit required-полями в конструкторе, если критично).
+- Не подключай `@Slf4j` там, где логирование не нужно — лишний бойлерплейс не оправдан.
 
-### 1.3 MapStruct и мапперы
+### 1.4 MapStruct
 
-Все мапперы — интерфейсы `@Mapper(config = StrictMapperConfiguration.class)` с `componentModel = "spring"`. Центральный конфиг — `configuration/mapper/StrictMapperConfiguration.java` (`@MapperConfig(componentModel = SPRING, unmappedTargetPolicy = ERROR)`). Для явного маппинга применяется `@BeanMapping(ignoreByDefault = true)` и `@Mappings({@Mapping(target=..., source=...)})`. Пример — `configuration/mapper/request/creation/ServiceCreateRequestToEntityMapper.java`. Мапперы разбиты на `request` (creation + mdm) и `response` (creation + dto), совпадают с скан-слоем `mapping`.
+- **MapStruct — приоритетный способ маппинга** DTO ↔ entity (и entity ↔ event-DTO, см. `11_kafka.md`) в проекте. Ручная сборка объекта (`new OrderResponse(...)`/сеттеры одно за другим в сервисе или в обычном Java-классе-мапере) — обоснованное исключение только там, где преобразование не выражается декларативно (сложная условная логика, ветвление по бизнес-правилу), а не выбор по умолчанию из привычки.
+- Маппер — интерфейс `@Mapper(componentModel = "spring")`, желательно с общим `@MapperConfig` (например `unmappedTargetPolicy = ERROR`), чтобы забытое поле давало ошибку компиляции, а не тихо терялось.
+- Явный маппинг несовпадающих имён — через `@Mapping(target = ..., source = ...)`; для маппинга "только явно перечисленные поля" — `@BeanMapping(ignoreByDefault = true)`.
+- Один маппер — одно направление/пара типов; не собирай в одном интерфейсе логику из разных доменов.
+- **Маппинг связанных/вложенных объектов** — через параметр `uses = {...}` в `@Mapper`, переиспользуя отдельный маппер вложенного типа (например, маппер `Order → OrderResponse` подключает `uses = {OrderLineMapper.class}` для вложенных `OrderLine → OrderLineResponse`), а не дублирует логику вложенного маппинга внутри одного интерфейса и не мапит вложенный объект вручную.
 
-### 1.4 Entities и иерархия `Service`
+### 1.5 Контроллеры — тонкие
 
-`model/entity/Service.java` — корневая сущность: `@Entity @Table(name = "service")`, `@Id @GeneratedValue(strategy = GenerationType.UUID)`; держит списки дочерних объектов через `@OneToMany(mappedBy = "service", cascade = CascadeType.ALL)`: `rentalObjects`, `assetObjects`, `capObjects`, `finapObjects` и `@OneToOne` `organisation`; hand-rolled методы `addRentalObject(...)`, `addAssetObject(...)`, `addCapObject(...)`, `addFinapObject(...)`, `setOrganisation(...)` поддерживают двустороннюю привязку. Энумы — `model/enums` (например `ObjectTypeName` связывает тип объекта с его классом).
+Контроллер: валидация (`@Valid`), проброс обязательных заголовков, вызов сервиса, преобразование результата в `ResponseEntity`. Никакой бизнес-логики, циклов с побочными эффектами или прямых обращений к репозиторию. Подробнее про контракт, статусы и обработку ошибок — `07_api_contract.md`.
 
-### 1.5 Контроллер и Swagger-контракт
+### 1.6 Форматирование вызовов методов
 
-`controller/ObjectController.java` — единственный REST-контроллер: `@RestController @RequestMapping(DEFAULT_URL_PREFIX_API + OBJECTS_URL_PREFIX_APU)`, endpoints `GET /{contract-version-id}` и `POST`. Внутри — тонкая логика: валидация `@Valid`, обязательные заголовки `X-Request-Id`, `X-Correlation-Id`, `X-SberPDI` (`requestId`, `correlationId`, `sberId`) и делегирование в сервис.
+- **≤3 параметра** — вызов в одну строку.
+- **4 параметра** — каждый аргумент с новой строки.
+- **≥5 параметров** — вынеси параметры в класс/`record`-обёртку; либо это сигнал, что метод делает слишком много (см. `16_refactoring.md`).
 
-**Нарушение (по `facts/gap_report.json` → `01_coding.controller_api_interface` = violation, count=0):** в `src/main/java` **отсутствуют** интерфейсы `*ControllerApi` (паттерн «ControllerApi» не найден). Swagger-контракт реализован не через интерфейс-контракт, а через **кастомные swagger-аннотации** в `controller/swagger/ObjectControllerDocs.java` (`@ObjectControllerDocs.GetObjectByContractVersionIdDocs`, `@ObjectControllerDocs.CreateObjectDocs`).
+### 1.7 `enum` vs константы
 
-### 1.6 Compliant-проверки (по gap_report, rule 01)
+Используй `enum` вместо `static final`-констант для:
 
-- `01_coding.data_on_dto` — **compliant**: `@Data` на DTO не найдено (count=0); DTO в `objects-rest-client` иммутабельны.
-- `01_coding.autowired_injection` — **compliant**: `@Autowired` на полях не найдено (count=0); DI через `@RequiredArgsConstructor`.
-- `01_coding.max_dependencies` — **compliant**: классов >7 `private final` зависимостей нет (count=0).
-- `01_coding.value_annotation` — **compliant**: россыпи `@Value("${...}")` нет (count=0).
+1. Типов и классификаторов (типы объектов, типы операций).
+2. Статусов и состояний жизненного цикла (`OrderStatus`).
+3. Кодов ошибок/ответов с ограниченным набором значений.
+4. Флагов с числом значений >2.
 
-### 1.7 Форматирование вызовов методов и порог параметров
+Флаг ровно с двумя значениями — предпочтительно `boolean`, если семантика `true`/`false` однозначна и не нуждается в дополнительных именах; `enum` на два значения оправдан, только когда нужны говорящие имена состояний, которые `boolean` не передаёт (например, `SYNC`/`ASYNC` выразительнее, чем `isAsync`).
 
-**Статус: compliant, но правило зафиксировано.** В текущем коде нет методов с >5 параметрами (максимум 4 в контроллере: `ObjectController.createObject`).
+Константы (`static final`) оставляй для конфигурационных значений (URL-префиксы, имена заголовков, лимиты) и системных/математических констант.
 
-Соглашение по параметрам и форматированию вызовов:
+Структура `enum` — см. пример в §4.
 
-- **<=3 параметра** — вызов в одну строку:
-  ```java
-  serviceService.getServiceByContractVersionId(contractVersionId, requestId);
-  ```
+В JPA-сущностях — `@Enumerated(EnumType.STRING)`, никогда не `ORDINAL` (порядок значений `enum` не должен влиять на хранимые данные — вставка нового значения в середину списка молча меняет смысл уже сохранённых строк).
 
-- **4 параметра** — каждый аргумент с новой строки, перенос до первого и после последнего:
-  ```java
-  objectCreationService.createObject(
-          request,
-          requestId,
-          correlationId,
-          sberId
-  );
-  ```
+### 1.8 Null-safety и Optional
 
-- **>=5 параметров** — создать класс-обёртку для параметров. Использовать только если вложенность методов становится нечитаемой:
-  ```java
-  public record CreateUserParams(String name, String email, String role, UUID deptId, UUID managerId) {}
-  
-  userService.createUser(new CreateUserParams(name, email, role, deptId, managerId));
-  ```
+- `Optional<T>` — только как тип возврата метода на границе, где отсутствие значения — ожидаемый и осмысленный исход (`findByX` в сервисе/репозитории); никогда как тип поля entity/DTO и никогда как тип параметра метода — для необязательного входного значения используй перегрузку метода или обычный nullable-параметр.
+- Методы, возвращающие коллекции (`List`/`Set`/`Map`), никогда не возвращают `null` — пустая коллекция (`List.of()`, `Collections.emptyList()`), чтобы не перекладывать null-проверку на каждый вызывающий код.
+- Обязательные параметры конструктора/метода, у которых nullability неочевидна из контекста, — явная проверка `Objects.requireNonNull(param, "сообщение")`, а не молчаливый `NullPointerException` в глубине метода.
+- Аннотации `@Nullable`/`@NonNull` (например, `org.jspecify` или `jakarta.annotation`) — для документирования nullability на границах API/публичных методов там, где это не очевидно из типа (`Optional<T>` уже самодокументируется и в дополнительной аннотации не нуждается).
 
-<!-- source: auto -->
+### 1.9 Прочие общепринятые практики
+
+- Предпочитай `var` там, где тип очевиден из правой части — но не в публичных сигнатурах методов.
+- Не глотай исключения (`catch (Exception e) {}`); минимум — залогировать с контекстом, максимум — обернуть в доменное исключение.
+- Не используй проверяемые исключения в доменной логике сервисов — доменные ошибки моделируй unchecked-исключениями с обработкой в `@RestControllerAdvice`.
+- Доменные исключения сервиса наследуются от единого базового unchecked-класса на проект (например, `OrderServiceException extends RuntimeException`), а не образуют разрозненные независимые иерархии — упрощает единообразную обработку в `@RestControllerAdvice` (`@ExceptionHandler(OrderServiceException.class)` как общий случай, конкретные подтипы — где нужна разная семантика ответа).
+- Избегай статических утилитных классов для бизнес-логики — только для чистых функций без состояния (форматирование, конвертация).
+
+### 1.10 Принципы SOLID
+
+Правила выше в этом файле уже реализуют большую часть SOLID; здесь — явная связка с каждой буквой и то, чего не хватает:
+
+- **S (Single Responsibility)** — класс отвечает за одну причину изменения. Порог в 7 `private final`-зависимостей (§1.2) и лимиты длины/цикломатической сложности метода (`16_refactoring.md`) — механические индикаторы того, что класс/метод взял на себя больше одной ответственности.
+- **O (Open/Closed)** — новое поведение добавляется новой реализацией интерфейса или новым вариантом паттерна (см. §1.11), не модификацией условной логики (`if`/`switch` по типу) внутри уже существующего класса; растущая цепочка `if (type == X)`/`switch` по доменному типу — сигнал перейти на Strategy/полиморфизм.
+- **L (Liskov Substitution)** — альтернативные реализации одного интерфейса сервиса взаимозаменяемы: ни одна не сужает контракт (не бросает `UnsupportedOperationException` на части унаследованных методов) и не меняет постусловия, ожидаемые вызывающим кодом.
+- **I (Interface Segregation)** — интерфейс сервиса не разрастается в «толстый» интерфейс на несколько логически не связанных друг с другом групп методов; отдельная зона ответственности потребителя — отдельный, узкий интерфейс, а не один общий с методами, которые нужны не всем реализациям.
+- **D (Dependency Inversion)** — уже покрыто constructor injection в §1.2: сервис зависит от абстракции (интерфейса репозитория/клиента), не от конкретной реализации; здесь — явная ссылка на то, что это и есть DIP.
+
+### 1.11 Паттерны проектирования — отдельный пакет
+
+Использование обоснованных паттернов проектирования (Strategy, Template Method, Builder, Chain of Responsibility, Scenario/Step и т.п.) там, где паттерн реально решает проблему (устраняет дублирование, убирает разрастающуюся условную логику по типу) — **приветствуется**: это хорошая практика, а не избыточное усложнение.
+
+При этом реализация паттерна не пишется инлайн внутри `service`/`service.impl` — выносится в отдельный пакет, названный по паттерну (например `pattern/strategy/orderpricing/` или `util/scenario/`). Один пакет — один паттерн; реализации разных паттернов не смешиваются в одном пакете. Сервис только вызывает готовую реализацию через внедрённую зависимость (конструктор, см. §1.2) — не содержит логику паттерна сам.
+
+Вводи паттерн по правилу трёх (см. `16_refactoring.md`) и там, где он решает подтверждённую проблему, а не «про запас» на гипотетический будущий случай.
+
+### 1.12 Именование
+
+- Классы/интерфейсы — `PascalCase`; поля, методы, локальные переменные — `camelCase`; константы (`static final`) — `UPPER_SNAKE_CASE`.
+- Идентификаторы — только на английском, без сокращений ради экономии символов (`orderCount`, не `ordCnt`).
+- Булевы переменные/методы называются как вопрос: `isValid`, `hasNext`, `isAsync`.
+- Интерфейс сервиса — без префикса `I` (`OrderService`, не `IOrderService`), см. пример в §4.
+- Пакеты — lowercase, без разделителей заглавными буквами.
+- Именование PK/FK-полей и колонок сущностей — см. `08_database.md`.
+
+### 1.13 Магические числа и строки
+
+Не хардкодь литералы с самостоятельным смыслом (лимиты, коды статусов, повторяющиеся строковые значения) прямо в местах использования — выноси в именованные `private static final`-константы. Соседнее правило — §1.7 (`enum` вместо констант там, где значение — один из конечного набора вариантов, а не одиночный лимит/порог).
+
+### 1.14 Форматирование кода
+
+- Отступ — 4 пробела, без табуляции.
+- Открывающая фигурная скобка — на той же строке, что и объявление (`if (...) {`, `public void foo() {`).
+- Длина строки — ориентировочно до ~120 символов.
+- Не оставляй закомментированный (мёртвый) код и `TODO` без ссылки на задачу — либо доделай, либо заведи задачу и явно опиши, что доделать.
+- Форматирование вызовов по числу параметров — отдельное более специфичное правило, см. §1.6.
+
+### 1.15 Неизменяемость вне DTO
+
+- `final` для полей и локальных переменных там, где это не мешает читаемости — особенно для полей, инициализируемых в конструкторе (естественно для §1.2).
+- Не изменяй коллекции/объекты, переданные извне, без явной необходимости.
+- Возвращая наружу внутреннюю коллекцию — отдавай неизменяемую копию/обёртку, если вызывающий код не должен её мутировать.
+
+### 1.16 Комментарии и Javadoc
+
+- Публичные интерфейсы сервисов, их реализации и публичные методы контроллеров/сервисов — с Javadoc: у класса — назначение, у метода — краткое описание; если метод бросает исключение (checked или доменный unchecked) — обязателен `@throws` с условием возникновения.
+- Приватные методы Javadoc не требуют, кроме случая, когда приватный метод содержит нетривиальную логику (несколько условий/веток, неочевидная последовательность действий) — тогда Javadoc обязателен и для него.
+- JPA-сущности (`model/entity`) — Javadoc в простой форме: одна строка с назначением сущности, без `@param`/`@return`.
+- Обычный (не Javadoc) комментарий — только там, где конкретная строка/блок делает неочевидную вещь: скрытое поведение Spring/Hibernate под капотом (ленивая загрузка, порядок flush/commit, побочный эффект аннотации) либо бизнес-условие, не следующее напрямую из кода. Не комментируй очевидное.
+- Язык документации/комментариев — командная конвенция, единая для проекта; идентификаторы кода при этом остаются на английском (см. §1.12). В примерах этого набора правил используется русский — уже принятый в этом файле стиль (см. описания `OrderStatus` в §4).
+
+### 1.17 Импорты
+
+- Без wildcard-импортов (`import ...*`).
+- Два блока, разделённых одной пустой строкой: (1) всё, кроме `java.*` — свои пакеты, `jakarta.*`, `lombok.*`, `org.springframework.*` и т.д. — одним отсортированным по алфавиту списком, без деления на подгруппы; (2) `java.*` — отдельным блоком внизу, тоже отсортированным по алфавиту.
+- Статические импорты (`import static ...`) — отдельный третий блок, после блока `java.*`.
+
 ## 2. Соглашения для агента
 
-- Размещай сервис-логику в `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/service/` в подпакете по домену: `service/object/*` для объектов договора и `service/mdm/*` для MDM-данных; реализацию в том же `service/*/impl/` с суффиксом `Impl` (как `service/mdm/impl/OrganisationServiceImpl.java`, `service/object/impl/ServiceServiceImpl.java`). Интерфейс объявляй рядом в корне пакета (`service/mdm/OrganisationService.java`).
-- Впрыскивай зависимости только через constructor injection: для `private final` полей класса используй `@RequiredArgsConstructor` + `private final` (`@Service`) — так же, как в `OrganisationServiceImpl`, никогда не используй `@Autowired` на полях (в репо count=0).
-- Для преобразований используй MapStruct-мапперы в `configuration/mapper/`, разделяй на `request/` и `response/` (`ServiceCreateRequestToEntityMapper` в `request/creation`, `ServiceToServiceDtoMapper` в `response/dto`); каждый маппер `@Mapper(config = StrictMapperConfiguration.class)` из `configuration/mapper/StrictMapperConfiguration.java` со `componentModel = "spring"`.
-- Класть JPA-сущности в `model/entity/`, енумы в `model/enums/`; репозитории в `repository/` наследуют `JpaRepository<T, UUID>` (пример `repository/ServiceRepository.java`).
-- Swagger-контракт выноси в отдельный класс-аннотаций `controller/swagger/*Docs` и аннотируй методы контроллера составными аннотациями (как `ObjectControllerDocs`), поскольку паттерн `*ControllerApi` интерфейсов не используется и не генерируется в этом репо.
-- Держи контроллер thin: только валидация `@Valid`, проброс обязательных заголовков (`X-Request-Id`, `X-Correlation-Id`, `X-SberPDI`) и вызов сервиса; не пиши бизнес-логику в контроллере.
+- Новый сервис размещай в `service/{domain}/impl/` с суффиксом `Impl`; заводи отдельный интерфейс в `service/{domain}/`, только если есть вторая реализация, тестовый мок через интерфейс или сервис пересекает границу модуля — иначе используй класс с бизнес-логикой напрямую.
+- DI — исключительно через `@RequiredArgsConstructor` + `private final` поля; при появлении 8-й зависимости сначала предложи разделение класса по SRP, не добавляй `@Autowired`/сеттер-инъекцию как обход лимита.
+- DTO оформляй как `record` (Java 17+) или `@Value @Builder`; не отдавай JPA-сущность напрямую как тело HTTP-ответа и не вешай `@Data` ни на DTO, ни на entity.
+- MapStruct — приоритетный способ маппинга DTO/entity/event; один интерфейс на направление/пару типов с `@Mapper(config = ...)` из общего `@MapperConfig` (`unmappedTargetPolicy = ERROR`); при разных именах полей — явный `@Mapping`, при частичном маппинге — `@BeanMapping(ignoreByDefault = true)`; для вложенных/связанных объектов — `uses = {...}` с отдельным маппером вложенного типа, не ручной маппинг и не дублирование логики вложенного маппинга.
+- Контроллер оставляй тонким: `@Valid`, обязательные заголовки, вызов сервиса, `ResponseEntity`; любую бизнес-логику или цикл с побочными эффектами выноси в сервис.
+- Вызов с ≥5 параметрами не пиши как есть — сразу оборачивай в `record`-параметр или сигнализируй, что метод делает слишком много.
+- Новый статус/тип/код с конечным набором значений — `enum`, не набор `static final`; в JPA-поле — `@Enumerated(EnumType.STRING)`, никогда `ORDINAL`.
+- Не добавляй `Optional<T>` как параметр метода или поле сущности/DTO — только как тип возврата; методы, возвращающие коллекции, возвращай пустую коллекцию, а не `null`.
+- Не пиши `catch (Exception e) {}`; для доменных ошибок сервисов используй unchecked-исключения от единого базового класса на проект (`OrderServiceException`), а не проверяемые и не разрозненные независимые иерархии.
+- Растущую цепочку `if`/`switch` по доменному типу — не наращивай дальше веткой; замени на Strategy/полиморфизм (OCP, см. §1.10) или на паттерн, вынесенный в отдельный пакет (см. §1.11).
+- Реализацию паттерна (Strategy/Template Method/Builder/Chain of Responsibility и т.п.) размещай в отдельном пакете по паттерну, не инлайном в `service.impl`; сервис вызывает её через DI. Не отказывайся от паттерна из опасения «усложнения» — обоснованный паттерн приветствуется; вводи его по правилу трёх (`16_refactoring.md`).
+- Новый класс/метод/переменную называй по §1.12 (`PascalCase`/`camelCase`/`UPPER_SNAKE_CASE`, английские идентификаторы, `isX`/`hasX` для булевых); интерфейс сервиса — без префикса `I`.
+- Литерал с самостоятельным смыслом (лимит, код, повторяющаяся строка) — сразу в `private static final`-константу, не инлайном в месте использования.
+- Публичный метод сервиса/контроллера — с Javadoc (`@param`/`@return`/`@throws` при необходимости, см. §1.16); новый импорт — без wildcard, в блоках по §1.17.
 
-<!-- source: auto -->
 ## 3. Чек-лист
 
-- [ ] Реализация сервиса — в `service/{domain}/impl/` с суффиксом `Impl`, интерфейс — в `service/{domain}/` (или уже существующий интерфейс расширяется).
-- [ ] DI через constructor injection (`@RequiredArgsConstructor`, `private final`), а не `@Autowired` на полях.
-- [ ] Новые классы размещай в правильном пакете-слое (`service`, `controller`, `repository`, `model/entity`, `model/enums`, `configuration/mapper/*`).
-- [ ] MapStruct-маппер — `@Mapper(config = StrictMapperConfiguration.class)` со `componentModel = "spring"`; дочерние маппинги игнор через `@BeanMapping(ignoreByDefault = true)`.
-- [ ] Контроллеры — thin: валидация + делегирование в сервис; Swagger-контракт — через `controller/swagger/*Docs`.
-- [ ] Новые энумы — в `model/enums/`, новые entity — в `model/entity/` с annotations Lombok (`@Getter/@Setter`) и JPA (`@Entity`, `@Table`, `@Id @GeneratedValue`).
-- [ ] При отсутствии паттерна `*ControllerApi` — не вводить его в качестве обязательного; следовать текущей схеме `ObjectController` + `ObjectControllerDocs`.
-- [ ] <=3 параметра — вызов в одну строку; 4 параметра — каждый аргумент с новой строки, перенос до первого и после последнего; >=5 параметров — класс-обёртка (record/class).
+- [ ] DI — только constructor injection (`@RequiredArgsConstructor`/явный конструктор), без `@Autowired` на полях
+- [ ] Класс не имеет >7 зависимостей (иначе — разделение по SRP)
+- [ ] DTO неизменяемы (`record` или `@Value @Builder`), `@Data` не используется на DTO и entity
+- [ ] На JPA-сущностях `equals`/`hashCode` не сгенерированы по всем полям бездумно (`@Data`)
+- [ ] MapStruct-маппер использует строгую конфигурацию (`unmappedTargetPolicy = ERROR`)
+- [ ] Контроллер не содержит бизнес-логики
+- [ ] Параметры вызовов оформлены по правилу ≤3/4/≥5
+- [ ] Типы/статусы/коды — `enum`, а не набор констант; в JPA — `@Enumerated(EnumType.STRING)`
+- [ ] Флаг с 2 значениями — `boolean`, а не `enum` (если семантика поля не требует говорящих имён)
+- [ ] `Optional<T>` не используется как тип параметра/поля; методы не возвращают `null` вместо пустой коллекции
+- [ ] Нет пустых `catch` блоков и проглоченных исключений
+- [ ] Доменные исключения сервиса наследуются от единого базового unchecked-класса проекта
+- [ ] MapStruct использован как приоритетный способ маппинга; вложенные/связанные типы маппятся через `uses = {...}`, не вручную
+- [ ] Новое поведение по типу добавлено новой реализацией/паттерном (OCP), а не веткой `if`/`switch` в существующем классе
+- [ ] Реализация паттерна проектирования (если использован) — в отдельном пакете по паттерну, не инлайн в `service.impl`
+- [ ] Интерфейс сервиса не «толстый» (ISP): методы в нём — одной зоны ответственности
+- [ ] Именование — `PascalCase`/`camelCase`/`UPPER_SNAKE_CASE`, идентификаторы на английском, булевы — `isX`/`hasX`, интерфейс сервиса без префикса `I`
+- [ ] Нет магических чисел/строк — вынесены в `private static final`
+- [ ] Отступ 4 пробела, скобка на той же строке, строка ≤~120 символов, нет мёртвого кода/`TODO` без задачи
+- [ ] `final` там, где уместно; коллекции, переданные извне, не мутируются; возвращаемая внутренняя коллекция — неизменяемая копия при необходимости
+- [ ] Публичные методы/классы сервисного и контроллерного слоя — с Javadoc (`@throws` при исключениях); JPA-сущности — с однострочным Javadoc; комментарии — только для неочевидного
+- [ ] Импорты — без wildcard, в трёх блоках (не-`java.*` / `java.*` / static)
 
-<!-- source: auto -->
-## 4. Примеры из кода
+## 4. Примеры кода
 
-### Example 1: `services.mdm.OrganisationService` (интерфейс + impl)
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/service/mdm/OrganisationService.java`
+DI и структура сервиса:
 
 ```java
-public interface OrganisationService {
-    Organisation createOrganisation(OrganisationCreateRequest organisationCreateRequest);
+@Service
+@RequiredArgsConstructor
+public class OrderServiceImpl implements OrderService {
+    private final OrderRepository orderRepository;
+    private final OrderToOrderDtoMapper orderMapper;
+    ...
 }
 ```
 
-Реализация `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/service/mdm/impl/OrganisationServiceImpl.java` — `@Slf4j @Service @RequiredArgsConstructor`, строит entity через builder.
-
-### Example 2: `configuration.mapper` (MapStruct со строгим конфигом)
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/mapper/request/creation/ServiceCreateRequestToEntityMapper.java`
+MapStruct со строгим конфигом:
 
 ```java
-@Mapper(config = StrictMapperConfiguration.class)
-public interface ServiceCreateRequestToEntityMapper {
+@Mapper(config = StrictMapperConfig.class)
+public interface OrderCreateRequestToEntityMapper {
     @BeanMapping(ignoreByDefault = true)
-    @Mappings({ @Mapping(target = "contractId", source = "creationObject.contractId"),
-                @Mapping(target = "serviceId", ignore = true) })
-    Service toService(DataService serviceRequest, Organisation organisation, CreationObject creationObject);
+    @Mapping(target = "customerId", source = "request.customerId")
+    @Mapping(target = "status", ignore = true)
+    Order toEntity(OrderCreateRequest request);
 }
 ```
 
-### Example 3: `controller` — `ObjectController` + Swagger-docs
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/controller/ObjectController.java` и `.../swagger/ObjectControllerDocs.java`
-
-Thin-контроллер: `@RestController`, `@RequiredArgsConstructor`, два сервиса как `private final`, метод-аннотации `@ObjectControllerDocs.GetObjectByContractVersionIdDocs` / `@ObjectControllerDocs.CreateObjectDocs`, проброс заголовков и возврат `ObjectsDTO` / `ObjectsCreationResponse`.
-
-### Example 4: Форматирование вызовов методов
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/controller/ObjectController.java`
-
-Вызов метода с 4 параметрами — каждый аргумент с новой строки:
+MapStruct с `uses` для вложенного объекта:
 
 ```java
-@PostMapping
-public ResponseEntity<ObjectsCreationResponse> createObject(
-        @RequestBody @Valid ObjectCreateRequest objectCreateRequest,
-        @RequestHeader(value = REQUEST_ID_HEADER_KEY) UUID requestId,
-        @RequestHeader(value = CORRELATION_ID_HEADER_KEY) UUID correlationId,
-        @RequestHeader(value = SBERPDI_HEADER_KEY) String sberId
-) {
-    return ResponseEntity.status(HttpStatus.CREATED)
-            .header(RESPONSE_ID_HEADER_KEY, requestId.toString())
-            .body(objectCreationService.createObject(
-                    objectCreateRequest,
-                    requestId,
-                    correlationId,
-                    sberId
-            ));
+@Mapper(config = StrictMapperConfig.class, uses = OrderLineMapper.class)
+public interface OrderToOrderResponseMapper {
+    OrderResponse toResponse(Order order); // order.lines() маппится через OrderLineMapper, не вручную
 }
 ```
 
-Если бы параметров стало 5+, создался бы record-обёртка:
-```java
-public record CreateObjectParams(
-        ObjectCreateRequest request,
-        UUID requestId,
-        UUID correlationId,
-        String sberId,
-        UUID tenantId
-) {}
+Паттерн (Strategy) — реализация в отдельном пакете `pattern/strategy/orderpricing/`, сервис вызывает через DI:
 
-objectCreationService.createObject(
-        new CreateObjectParams(request, requestId, correlationId, sberId, tenantId)
+```java
+// pattern/strategy/orderpricing/OrderPricingStrategy.java
+public interface OrderPricingStrategy {
+    BigDecimal calculatePrice(Order order);
+}
+
+// pattern/strategy/orderpricing/StandardOrderPricingStrategy.java
+@Component
+public class StandardOrderPricingStrategy implements OrderPricingStrategy {
+    @Override
+    public BigDecimal calculatePrice(Order order) { ... }
+}
+
+// service/impl/OrderServiceImpl.java — не содержит логику стратегии, только вызывает её
+@Service
+@RequiredArgsConstructor
+public class OrderServiceImpl implements OrderService {
+    private final OrderPricingStrategy pricingStrategy;
+    ...
+}
+```
+
+Javadoc на публичном методе сервиса:
+
+```java
+/**
+ * Создаёт заказ и сохраняет его в базе данных.
+ *
+ * @param request данные для создания заказа
+ * @return созданный заказ в виде DTO-ответа
+ * @throws OrderAlreadyExistsException если заказ с таким внешним идентификатором уже существует
+ */
+OrderResponse createOrder(OrderCreateRequest request);
+```
+
+Блок импортов (без wildcard, три блока):
+
+```java
+import com.example.orders.model.entity.Order;
+import jakarta.persistence.Entity;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+
+import java.math.BigDecimal;
+import java.util.List;
+
+import static java.util.Objects.requireNonNull;
+```
+
+Форматирование вызовов по числу параметров:
+
+```java
+orderService.getOrderByCustomerId(customerId, requestId); // ≤3 — одна строка
+
+objectCreationService.createOrder(                          // 4 — каждый с новой строки
+        request,
+        requestId,
+        correlationId,
+        traceId
 );
+
+public record CreateOrderParams(OrderCreateRequest request, UUID requestId, UUID correlationId, String traceId, UUID tenantId) {}
+orderService.createOrder(new CreateOrderParams(request, requestId, correlationId, traceId, tenantId)); // ≥5
 ```
 
-### Example 5: Вызов с <=3 параметрами — в одну строку
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/service/object/impl/ServiceServiceImpl.java`
+Структура `enum`:
 
 ```java
-public ObjectsDTO getServiceByContractVersionId(UUID contractVersionId, UUID requestId) {
-    List<Service> services = serviceRepository.findByContractVersionId(contractVersionId);
-    return serviceMapper.toObjectsDTO(services); // 2 параметра — одна строка
+@Getter
+@AllArgsConstructor
+public enum OrderStatus {
+    NEW("Создан"),
+    CONFIRMED("Подтверждён"),
+    CANCELLED("Отменён");
+
+    private final String description;
+
+    public static OrderStatus fromValue(String value) {
+        return Arrays.stream(values())
+                .filter(status -> status.name().equalsIgnoreCase(value))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("Unknown status: " + value));
+    }
 }
 ```
 
-<!-- source: auto -->
-## 5. Исключения и оговорки
+## 5. Когда пересматривать
 
-Соглашение про слои и DI подтверждается локальным кодом. Разделы про Kafka (`kafka` слой пуст) и клиентский контракт (`objects-rest-client`) здесь не детализируются — см. глобальный регламент `rules/01_coding.md` и отдельные темы. Если в новом коде появится Kafka-слой или генерация `*ControllerApi`, этот документ следует пересмотреть.
-
-<!-- source: auto -->
-## 6. Обновление
-
-Пересобирать при крупном рефакторинге пакетной структуры, введении паттерна `ControllerApi`-интерфейсов, изменении политики MapStruct/конфигурации `StrictMapperConfiguration`, либо после массового добавления новых сущностей/энумов.
+При смене политики MapStruct/DI, введении паттерна контрактных интерфейсов контроллеров, массовом переходе на `record` для DTO, при принятии единого null-safety тулинга (например, статический анализ на `@NonNull`), либо при смене конвенций именования/форматирования, языка документации или политики использования паттернов проектирования (например, подключении нового статического анализатора, проверяющего структуру пакетов).

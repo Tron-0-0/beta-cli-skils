@@ -103,10 +103,10 @@ author: Альберт Гафаров
    | «БД», «таблица», «колонка», «Liquibase», «SQL», «миграция», «COMMENT ON» | `03_migrations.md`, `08_database.md` |
    | «Controller», «endpoint», «REST», «Swagger», «API», «запрос», «ответ», «header» | `01_coding.md`, `07_api_contract.md` |
    | «Entity», «JPA», «репозиторий», `@Table` | `01_coding.md`, `08_database.md` |
-   | «маппер», «MapStruct», «DTO», «преобразование», `StrictMapperConfiguration` | `01_coding.md` |
+   | «маппер», «MapStruct», «DTO», «преобразование» | `01_coding.md` |
    | «сервис», «бизнес-логика», «валидация», `@Service` | `01_coding.md`, `16_refactoring.md` |
    | «денежное поле», «сумма», «стоимость», «BigDecimal», «руб», `NUMERIC` | `13_monetary.md` |
-   | «enum», «статус», «перечисление», «код», `ObjectStatus` | `17_enums_over_constants.md` |
+   | «enum», «статус», «перечисление», «код» | `01_coding.md` (§1.7 enum vs константы) |
    | «тест», «unit», `Mockito`, `AssertJ` | `06_unit_tests_with_spring_context.md` |
    | «логирование», «MDC», `@Slf4j`, `log.error` | `09_logging.md` |
    | «метрик», «health», «probe», `actuator` | `02_monitors.md` |

@@ -3,118 +3,138 @@ apply: always
 mode: all
 ---
 
-<!-- source: auto -->
-# Соглашение: Kafka: продюсеры, консюмеры, ретраи (profitcontr-objects)
+# Соглашение: Kafka — продюсеры, консюмеры, ретраи
 
-**Когда читать:** При работе с Kafka: создание consumer/producer, настройка топиков, обработка ошибок, либо при появлении Kafka-зависимости в сервисе. Сейчас сервис Kafka **не использует** — правила ниже фиксируют отсутствие Kafka-слоя и образец межсервисной интеграции через REST/Feign.
+**Когда читать:** при работе с Kafka — создание consumer/producer, настройка топиков, обработка ошибок, добавление первой Kafka-зависимости в сервис.
 
-**Что описывает:** Kafka consumer/producer, Inbox/Outbox паттерн, retry/DLT, идемпотентность. В текущем сервисе Kafka-слоя нет — фактический стек интеграций построен на OpenFeign и синхронном REST.
-
-**Глобальный эталон:** `rules/11_kafka.md`
+**Что описывает:** producer/consumer конфигурацию, обработку ошибок и DLT, идемпотентность сообщений, Outbox-паттерн.
 
 ---
 
-<!-- source: auto -->
-## 1. Наблюдения в репозитории
+## 1. Правило
 
-### 1.1 Kafka-слой отсутствует
+- **Не добавляй Kafka "про запас".** Зависимость (`spring-kafka`) подключается только под реальную задачу обмена сообщениями; межсервисные синхронные вызовы (REST/gRPC) — не повод заводить Kafka.
+- **Producer — идемпотентный** (`enable.idempotence=true`, по умолчанию включено в современных версиях клиента) — защита от дублей при ретраях на сетевых сбоях.
+- **Отправка — не fire-and-forget.** `KafkaTemplate.send(...)` возвращает `CompletableFuture` — результат отправки нужно проверять (callback/`whenComplete`, лог ошибки, метрика), иначе сбой отправки (недоступность брокера, timeout) проходит незамеченным и событие теряется без единого следа.
+- **Partition key — идентификатор агрегата** (например `orderId`), не пустой/случайный ключ — иначе события одной сущности могут разойтись по разным партициям и обрабатываться не по порядку; порядок в Kafka гарантируется только в пределах одной партиции по одному ключу.
+- **Publish и изменение состояния — атомарны через Outbox-паттерн:** запись бизнес-события и отправка в Kafka не должны быть независимыми шагами без гарантии согласованности — при падении между шагами событие теряется или дублируется без возможности восстановления. Событие сначала пишется в outbox-таблицу в той же транзакции, что и бизнес-изменение, отдельный процесс публикует его в Kafka и помечает как отправленное.
+- **Consumer десериализация безопасна:** `ErrorHandlingDeserializer` оборачивает целевой десериализатор, `spring.json.trusted.packages` — явный список пакетов, не `*` (widcard допускает десериализацию произвольных классов из сообщения — риск инъекции).
+- **Ack mode — ручной** (`AckMode.MANUAL`/`MANUAL_IMMEDIATE`), `enable.auto.commit=false` — коммит offset только после успешной обработки, чтобы падение между чтением и обработкой не теряло сообщение.
+- **Ошибки обработки — через DLT** (`DeadLetterPublishingRecoverer` + `DefaultErrorHandler`), с чётким разделением retryable/non-retryable исключений: `SerializationException`/`ConstraintViolationException`-подобные структурные ошибки не ретраятся (повтор не поможет), временные (сеть, недоступность зависимости) — ретраятся с backoff перед уходом в DLT.
+- **Слушатель не блокируется** — никакого `Thread.sleep` внутри обработчика; ретраи — через механизм error handler'а, не ручной цикл в коде листенера. Обработка одного батча укладывается в `max.poll.interval.ms` — консюмер, не успевший обработать батч в это окно, считается зависшим и выкидывается из группы с последующей ребалансировкой; долгую обработку (тяжёлые внешние вызовы, агрегации) не компенсировать увеличением интервала "про запас" без анализа фактической длительности.
+- **Consumer идемпотентен на уровне бизнес-логики** — обработка одного и того же события повторно (из-за at-least-once семантики Kafka) не должна приводить к дублирующим побочным эффектам; дедупликация по `eventId` на стороне потребителя.
+- **Event DTO — неизменяемые**, с обязательными полями `eventId`, `eventTimestamp`, `sourceSystem` для трассируемости и дедупликации.
+- **Корреляция в логах** — MDC в листенере проставляется в начале обработки сообщения (например, из `eventId` или заголовка сообщения), не наследуется автоматически из HTTP-фильтра — консюмер работает на собственном потоке (см. `09_logging.md`).
+- **Graceful shutdown листенера** — на остановке контейнера уже начатая обработка сообщения должна довершиться до коммита offset, а не оборваться на середине; жизненный цикл listener container'а настраивается отдельно от graceful shutdown HTTP-сервера (см. `10_cloud_native.md`).
+- **`client.id`** — уникален и осмыслен для каждого продюсера/консюмера (сервис + назначение), чтобы метрики и логи брокера были отличимы по клиенту.
+- **Типизированные фабрики на тип события** — `ProducerFactory<String, T>`/`KafkaTemplate<String, T>` и `ConsumerFactory<String, T>`/`ConcurrentKafkaListenerContainerFactory<String, T>`, параметризованные конкретным типом события (`T` — класс из `model/event`), не `Object`; отдельная конфигурация на каждый тип события, а не один общий `KafkaTemplate<String, Object>`/`ContainerFactory` на все сообщения сразу — это даёт типобезопасность на этапе компиляции.
+- **Имя топика** — kebab-case, точечная нотация `<домен>.<сущность>.<событие>` (например `orders.order.created`).
+- **`groupId`** консюмера — именованная константа (`private static final String`), не строковый литерал напрямую в `@KafkaListener`.
 
-По данным `facts/scan.json` Kafka в сервисе **не используется**:
-
-- `layers.kafka` — **пусто** (`[]`): нет классов в пакете `.../kafka/...`, `exception/kafka/`, `handler/`.
-- `scheduling` — **пусто** (`[]`): нет `*KafkaInboxScheduler*` / планировщиков Inbox.
-- `stack.stack_markers`: `spring_kafka: false`, `springwolf: false`, `kafka_inbox: false`.
-- В `objects/pom.xml` **нет** зависимостей `spring-kafka`, `spring-kafka-test`, `kafka-inbox-starter`, `springwolf-*`.
-
-### 1.2 Фактический стек интеграций — REST / OpenFeign
-
-Межсервисное взаимодействие в этом сервисе асинхронно по данным реализовано **не через сообщения**, а через синхронный REST-вызов и Feign-клиенты:
-
-- `objects-rest-client/pom.xml` — `spring-cloud-starter-openfeign` (стр. 17-19), `ssl-context-starter`, `jackson-databind`.
-- `objects-rest-client/src/main/java/ru/sbrf/sbererp/profitcontr/objects/client/ObjectsClient.java` — `@FeignClient(name = "objects-client", configuration = SSLFeignClientConfiguration.class)` с методами `createObjects` (`@PostMapping`) и `getObjectsByContractVersionId` (`@GetMapping`), проброс заголовков `request-id`, `correlation-id`, `sberpdi`.
-- `objects-rest-client/src/main/java/ru/sbrf/sbererp/profitcontr/objects/client/configuration/ObjectsClientAutoConfiguration.java` — `@AutoConfiguration @EnableFeignClients(basePackageClasses = ObjectsClient.class)`.
-- `application.properties`: `spring.cloud.openfeign.client.config.default.micrometer.enabled=${OPENFEIGN_MICROMETER_ENABLED:true}` и `sbererp.logging.enabled.feign=true`.
-
-Единственное упоминание Kafka — отключённые флаги логирования `sbererp.logging.enabled.kafka=false` / `enabled.sync-kafka=false` в `application.properties`, что лишь подтверждает отсутствие Kafka в рантайме.
-
-### 1.3 Идемпотентность и корреляция без Kafka
-
-Сквозная идентификация реализована на HTTP-уровне (заголовки), а не через Kafka-event fields:
-
-- `WebApplicationConstants` — константы `REQUEST_ID_HEADER_KEY="request-id"`, `CORRELATION_ID_HEADER_KEY="correlation-id"`, `SBERPDI_HEADER_KEY="sberpdi"`.
-- `ObjectController` и Feign `ObjectsClient` пробрасывают их через `@RequestHeader`.
-- Idempotency-starter отключён (закомментирован в `application.properties`).
-
----
-
-<!-- source: auto -->
 ## 2. Соглашения для агента
 
-1. **Не тащить Kafka-зависимости без реальной потребности.** В `objects/pom.xml` нет `spring-kafka` — не добавлять `spring-kafka`, `kafka-inbox-starter`, `springwolf-*` в сервис без бизнес-задачи на обмен сообщениями. Пока интеграции строятся на Feign/`objects-rest-client/pom.xml` и REST (`ObjectsClient.java`).
-2. **Межсервисные вызовы — через существующий Feign-контракт, а не через импровизированный обмен сообщениями.** Новые вызовы к внешним API добавлять методами в `ObjectsClient.java` (`@FeignClient`, конфигурация `SSLFeignClientConfiguration`), с обязательным пробросом `request-id` / `correlation-id` / `sberpdi`.
-3. **Если Kafka всё же добавится — применять глобальный эталон `rules/11_kafka.md` целиком, а не «частично».** Внедряемые консьюмеры/продюсеры должны следовать эталону: ErrorHandlingDeserializer (Trusted Packages без `*`), ручной `AckMode.MANUAL`, DLT `{topic}-DLT`, `KafkaClientIdProvider.buildClientId(...)`, `setObservationEnabled(true)`, отдельные бины `kafkaTemplate<Сущность>` / `kafkaListenerContainerFactory<Сущность>`, иммутабельные event-DTO (`@Value @Builder @Jacksonized` с `eventId`/`eventTimestamp`/`sourceSystem`).
-4. **Внешние настройки Kafka — только в `application.properties` через env-переменные** (по образцу остального `application.properties`, где все значения вынесены в `${...}`), не хардкодить топики/группы/`client.id`. Пока `spring_kafka: false`, эти ключи добавлять не требуется.
-5. **Не вводить Inbox/Outbox и планировщики до появления реального event-driven потока.** В `scheduling` пусто; не добавлять `@Scheduled` Inbox-обработчики («на будущее») — это создаст мёртвый код, не подтверждённый брокером.
+1. Не подключай `spring-kafka` без конкретной задачи асинхронного обмена сообщениями.
+2. Публикация события, связанная с изменением состояния в БД, — через Outbox-таблицу в той же транзакции, не прямой вызов `KafkaTemplate.send(...)` посреди бизнес-транзакции.
+3. Отправку через `KafkaTemplate.send(...)` — с обработкой результата (`whenComplete`/callback: лог ошибки, метрика), не оставляй возвращённый `CompletableFuture` без обработки.
+4. Ключ сообщения при отправке — идентификатор агрегата (`orderId` и т.п.), не `null` и не случайное значение, если порядок обработки по этой сущности важен.
+5. Новый consumer — `ErrorHandlingDeserializer` с явным `trusted.packages`, `AckMode.MANUAL`, `DefaultErrorHandler` с DLT-рекавери и различением retryable/non-retryable исключений.
+6. Event-DTO — `record`/`@Value @Builder` с `eventId`/`eventTimestamp`/`sourceSystem`; обработчик проверяет `eventId` на дубликат перед применением побочных эффектов.
+7. Листенер — в начале обработки сообщения проставляет MDC для корреляции в логах (см. `09_logging.md`); долгую обработку одного сообщения соотноси с `max.poll.interval.ms`, чтобы не спровоцировать ребалансировку.
+8. Настройки топиков/групп — через переменные окружения, не хардкод в коде; при 3+ связанных параметрах — `@ConfigurationProperties`-класс в своём неймспейсе, а не россыпь `@Value` (см. `12_configuration.md`).
+9. Новый тип события — своя конфигурация продюсера/консюмера, типизированная на его класс (`ProducerFactory<String, OrderEvent>` и т.п.), не расширение общего `Object`-конфига; имя топика — `<domain>.<entity>.<event>`; `groupId` — константа.
 
----
-
-<!-- source: auto -->
 ## 3. Чек-лист
 
-- [ ] В `objects/pom.xml` подтверждено отсутствие необоснованных зависимостей `spring-kafka` / `kafka-inbox-starter` / `springwolf-*` (пока Kafka не включён).
-- [ ] `facts/scan.json` по теме 11: `layers.kafka` пуст, `scheduling` пуст, `stack_markers.spring_kafka=false` — не менять без реальной задачи.
-- [ ] Новые интеграции идут через Feign-контракт (`ObjectsClient.java`, `objects-rest-client/pom.xml`), заголовки `request-id`/`correlation-id`/`sberpdi` пробрасываются.
-- [ ] Если Kafka добавлен — консьюмер использует `ErrorHandlingDeserializer` + явный `spring.json.trusted.packages` (без `*`), `AckMode.MANUAL`, `ENABLE_AUTO_COMMIT=false`.
-- [ ] Если Kafka добавлен — настроены DLT-стратегия `DeadLetterPublishingRecoverer` + `DefaultErrorHandler` (не ретраить `SerializationException`/`ConstraintViolationException`), ретраи не блокируют поток листенера (`Thread.sleep` запрещён).
-- [ ] Если Kafka добавлен — `client.id` формируется через `KafkaClientIdProvider`, имя бина по формату `kafkaTemplate<Сущность>` / `kafkaListenerContainerFactory<Сущность>`, `setObservationEnabled(true)`.
-- [ ] Если Kafka добавлен — event-DTO иммутабельные (`@Value @Builder @Jacksonized`) с полями `eventId`/`eventTimestamp`/`sourceSystem`; настройки топиков/групп вынесены в `application.properties` через env-переменные, секретов/адресов брокеров в коде нет.
+- [ ] Producer использует идемпотентную отправку
+- [ ] Результат `KafkaTemplate.send(...)` обрабатывается (не fire-and-forget), сбой отправки логируется/метрицируется
+- [ ] Ключ сообщения — идентификатор агрегата, если важен порядок обработки по сущности
+- [ ] Событие публикуется через Outbox, если связано с изменением состояния в той же транзакции
+- [ ] Consumer — `ErrorHandlingDeserializer` + явный `trusted.packages` (не `*`)
+- [ ] `AckMode.MANUAL`, `enable.auto.commit=false`
+- [ ] DLT настроен, retryable/non-retryable исключения различены
+- [ ] Листенер не блокируется (`Thread.sleep` отсутствует), обработка укладывается в `max.poll.interval.ms`
+- [ ] Consumer дедуплицирует по `eventId`
+- [ ] Event-DTO неизменяемы, содержат `eventId`/`eventTimestamp`/`sourceSystem`
+- [ ] MDC проставляется в начале обработки сообщения листенером
+- [ ] `client.id` осмыслен и уникален для продюсера/консюмера
+- [ ] Фабрики продюсера/консюмера типизированы на конкретный тип события, не `Object`; отдельная конфигурация на тип события
+- [ ] Имя топика — `<domain>.<entity>.<event>` в kebab-case; `groupId` — именованная константа, не литерал
 
----
-
-<!-- source: auto -->
-## 4. Примеры из кода
-
-### Example 1: ObjectsClient.java (фактический образец асинхронной/межсервисной интеграции)
-**Путь:** `objects-rest-client/src/main/java/ru/sbrf/sbererp/profitcontr/objects/client/ObjectsClient.java`
+## 4. Примеры кода
 
 ```java
-@FeignClient(
-        name = "objects-client",
-        configuration = SSLFeignClientConfiguration.class
-)
-public interface ObjectsClient {
-    String REQUEST_ID_HEADER_KEY = "request-id";
-    String CORRELATION_ID_HEADER_KEY = "correlation-id";
-    String SBERPDI_HEADER_KEY = "sberpdi";
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class OrderEventPublisher {
+    private static final String ORDER_CREATED_TOPIC = "orders.order.created"; // <domain>.<entity>.<event>
 
-    @PostMapping("/objects")
-    ObjectsCreationResponse createObjects(
-            @RequestBody ObjectCreateRequest request,
-            @RequestHeader(value = REQUEST_ID_HEADER_KEY) UUID requestId,
-            @RequestHeader(value = CORRELATION_ID_HEADER_KEY) UUID correlationId,
-            @RequestHeader(value = SBERPDI_HEADER_KEY) String sberPDI);
+    private final KafkaTemplate<String, OrderEvent> kafkaTemplate; // типизирован на OrderEvent, не Object
 
-    @GetMapping("/objects/{contract-version-id}")
-    ObjectsDTO getObjectsByContractVersionId(
-            @PathVariable("contract-version-id") UUID contractVersionId,
-            @RequestHeader(value = REQUEST_ID_HEADER_KEY) UUID requestId,
-            @RequestHeader(value = CORRELATION_ID_HEADER_KEY) UUID correlationId,
-            @RequestHeader(value = SBERPDI_HEADER_KEY) String sberPDI);
+    public void publish(OrderEvent event) {
+        kafkaTemplate.send(ORDER_CREATED_TOPIC, event.orderId().toString(), event) // ключ — id агрегата, не null
+                .whenComplete((result, ex) -> {
+                    if (ex != null) {
+                        log.error("Failed to publish order event {}", event.eventId(), ex);
+                    }
+                });
+    }
 }
 ```
 
-### Example 2: ObjectsClientAutoConfiguration.java (подключение Feign-клиента)
-**Путь:** `objects-rest-client/src/main/java/ru/sbrf/sbererp/profitcontr/objects/client/configuration/ObjectsClientAutoConfiguration.java`
-
-Назначение: автоконфигурация клиента для внешнего потребления; аналог того, как подключается интеграционный слой без Kafka.
-
 ```java
-@AutoConfiguration
-@EnableFeignClients(
-        basePackageClasses = ObjectsClient.class
-)
-public class ObjectsClientAutoConfiguration {
+public final class OrderEventKafkaConfig {
+    public static final String GROUP_ID = "order-service"; // константа, не литерал в @KafkaListener
+
+    private OrderEventKafkaConfig() {
+    }
+}
+
+@Bean
+public ConsumerFactory<String, OrderEvent> orderEventConsumerFactory() { // типизирован на OrderEvent, не Object
+    var deserializer = new ErrorHandlingDeserializer<>(new JsonDeserializer<>(OrderEvent.class));
+    var props = Map.of(
+            ConsumerConfig.GROUP_ID_CONFIG, OrderEventKafkaConfig.GROUP_ID,
+            ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false,
+            JsonDeserializer.TRUSTED_PACKAGES, "com.example.orders.event"
+    );
+    return new DefaultKafkaConsumerFactory<>(props, new StringDeserializer(), deserializer);
+}
+
+@Bean
+public DefaultErrorHandler errorHandler(KafkaTemplate<String, Object> template) { // DLT-recoverer — легитимное исключение из типизации: пересылает произвольные failed-записи как есть
+    var recoverer = new DeadLetterPublishingRecoverer(template);
+    var handler = new DefaultErrorHandler(recoverer, new FixedBackOff(1000L, 3));
+    handler.addNotRetryableExceptions(DeserializationException.class, ConstraintViolationException.class);
+    return handler;
 }
 ```
 
-> Если в будущем появится Kafka, образец event-driven-кода (продюсер/консьюмер/DLT) следует брать из глобального эталона `rules/11_kafka.md` в `core-gigacode-skills`, а не из этого файла — здесь Kafka-паттернов нет.
+```java
+public record OrderEvent(
+        UUID eventId,
+        Instant eventTimestamp,
+        String sourceSystem,
+        UUID orderId,
+        OrderStatus status
+) {}
+
+@KafkaListener(topics = "orders.order.created", groupId = OrderEventKafkaConfig.GROUP_ID, containerFactory = "orderEventListenerFactory")
+public void onOrderEvent(OrderEvent event, Acknowledgment ack) {
+    MDC.put("eventId", event.eventId().toString()); // консюмер — свой поток, контекст из HTTP-фильтра сюда не долетает
+    try {
+        if (processedEvents.contains(event.eventId())) {
+            ack.acknowledge();
+            return;
+        }
+        handle(event);
+        ack.acknowledge();
+    } finally {
+        MDC.clear();
+    }
+}
+```
+
+## 5. Когда пересматривать
+
+При смене клиента Kafka на альтернативный брокер сообщений, изменении гарантий доставки (at-least-once → exactly-once через транзакции), при систематических дублях/потерях сообщений в проде, либо при ребалансировках из-за превышения `max.poll.interval.ms`.

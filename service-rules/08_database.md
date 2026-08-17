@@ -3,170 +3,156 @@ apply: always
 mode: all
 ---
 
-<!-- source: auto -->
-# Соглашение: База данных, JPA, репозитории (profitcontr-objects)
+# Соглашение: База данных, JPA, репозитории
 
-**Когда читать:** При работе с JPA-сущностями, репозиториями, или SQL-запросами.
+**Когда читать:** при работе с JPA-сущностями, репозиториями, SQL-запросами.
 
-**Что описывает:** Entity маппинг, JPA-репозитории, связь с миграциями, fetch-стратегии.
-
-**Глобальный эталон:** `rules/08_database.md`
+**Что описывает:** маппинг сущностей, связи, аудит, блокировки, производительность запросов.
 
 ---
 
-<!-- source: auto -->
-## 1. Наблюдения в репозитории
+## 1. Правило
 
-### 1.1 Entity-классы и JPA-маппинг
+- **Маппинг** — `@Entity @Table(name = snake_case)`, PK — суррогатный (`UUID`/`BIGINT` с `@GeneratedValue`), имя таблицы/колонки совпадает с миграцией 1:1. Случайный UUID (v4, `GenerationType.UUID`) на таблице с высокой частотой вставки фрагментирует B-tree индекс — новые строки попадают в случайные позиции, а не в конец; на таких таблицах — time-ordered UUID (v7/ULID) или `BIGINT` + `IDENTITY`/`SEQUENCE`.
+- **Именование PK/FK** — поле PK в Java: `<table>Id` (`orderId`), колонка в БД: `<table>_id` (`order_id`). Поле связи (FK) в Java — объектная ссылка на связанную сущность через `@ManyToOne`/`@OneToOne` + `@JoinColumn`, именуется по сущности, **без** суффикса `Id` (`private Order order`, не `private UUID orderId`); колонка в `@JoinColumn` при этом всё равно `<table>_id`. Имя constraint для FK в миграции (см. `03_migrations.md`) — `fk_<referenced_table>`.
+- **Fetch-стратегия по умолчанию — `LAZY`** для всех связей (`@ManyToOne`/`@OneToOne` по умолчанию `EAGER` в JPA — переопределяй явно). `EAGER` — осознанное исключение, а не умолчание, потому что на графе связей `EAGER` быстро превращается в непредсказуемые каскадные подгрузки.
+- **`CascadeType.ALL` — не умолчание.** Каскадное удаление имеет смысл только на стороне владельца агрегата к его непосредственным дочерним сущностям, у которых нет самостоятельного жизненного цикла (order → order lines). Каскад от дочерней сущности к родителю (`@ManyToOne(cascade = ALL)`) почти всегда ошибка — удаление одной позиции не должно каскадно удалять родителя.
+- **Двунаправленные связи** — только когда обе стороны реально нужны в коде; униправленная связь проще в поддержке и не требует ручной синхронизации обеих сторон.
+- **N+1** — предотвращается через `JOIN FETCH`/`@EntityGraph` на запросах, где заранее известно, что связанные сущности понадобятся; не полагаться на `LAZY` + случайный доступ в цикле.
+- **Пагинация** — списковые repository-методы возвращают `Page<T>`/`Slice<T>` через `Pageable`, а не неограниченный `List<T>`. Известная ловушка: `JOIN FETCH`/`@EntityGraph` на коллекции вместе с `Pageable` в одном запросе даёт постраничную выборку в памяти (Hibernate-предупреждение HHH90003004) — Hibernate не может пагинировать на уровне SQL при декартовом произведении из fetch-join коллекции; в этом случае — двухшаговый запрос (сначала ID страницей, затем `JOIN FETCH` по списку ID) либо `@EntityGraph` без комбинации с `Pageable` на коллекциях.
+- **Bulk-обновления (`@Modifying`)** — `@Query` с `@Modifying` для массовых `UPDATE`/`DELETE` выполняется в обход persistence context: уже загруженные в текущей транзакции сущности не узнают об изменении. Обязателен `clearAutomatically = true` (и `flushAutomatically = true`, если до bulk-запроса в той же транзакции были неотправленные изменения) — иначе риск работать со stale-сущностями до конца транзакции.
+- **Optimistic locking** (`@Version`) — на сущностях, которые могут конкурентно изменяться разными транзакциями (типичный кандидат — любая изменяемая сущность с частым UPDATE). Конфликт (`OptimisticLockException`/`ObjectOptimisticLockingFailureException`) — ожидаемая бизнес-ситуация, не баг: на границе API транслируется в `409` (см. `07_api_contract.md`), не утекает как общий `500`.
+- **Транзакционные границы** — `@Transactional` ставится на методах сервиса (границе use case), не на репозитории и не на контроллере. Читающие методы — `@Transactional(readOnly = true)` (пропускает dirty checking, потенциально роутится на read-реплику). Внутри транзакции не делать вызовы к внешним системам (HTTP-клиенты, Kafka-продюсер) — они удерживают соединение/лок на время сетевого вызова и делают откат дорогим или невозможным.
+- **Производные query-методы** (`findByX`, `existsByX`) — обычные абстрактные методы интерфейса, реализацию генерирует Spring Data. Если имя получается длиннее ~40 символов (много условий через `And`/`Or`) или у метода больше 4 параметров — не наращивать имя дальше, а переходить на `@Query` (JPQL) с явным телом и коротким именем метода.
+- **`default`-методы репозитория** — допустимы для простой обработки результата запроса: разворачивание `Optional` (`.orElseThrow(...)`), тривиальная проверка. Внутри `default`-метода не делать ручную итерацию/`Stream`-фильтрацию коллекций (это выражается запросом, а не постобработкой в Java) и не размещать бизнес-логику (условия предметной области, оркестрацию нескольких сущностей) — она остаётся в сервисе.
+- **Аудит** — `@CreatedDate`/`@LastModifiedDate`/`@CreatedBy`/`@LastModifiedBy` через `@EntityListeners(AuditingEntityListener.class)` и общий `@MappedSuperclass`, включённый `@EnableJpaAuditing` на конфигурации.
+- **Open Session/EntityManager in View** — по умолчанию выключен в проде (`spring.jpa.open-in-view=false`); ленивая загрузка вне транзакции в контроллере — сигнал, что DTO-маппинг сделан в неправильном слое.
+- **Денежные поля** — `BigDecimal`, см. `13_monetary.md`.
 
-Все JPA-сущности лежат в `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/model/entity/` — 8 классов:
-
-- `Service.java` (`@Table(name = "service")`)
-- `AssetObject.java` (`@Table(name = "asset_object")`)
-- `RentalObject.java` (`@Table(name = "rental_object")`)
-- `CapObject.java` (`@Table(name = "cap_object")`)
-- `FinapObject.java` (`@Table(name = "finap_object")`)
-- `Partner.java` (`@Table(name = "partner")`)
-- `BankAccount.java` (`@Table(name = "bank_account")`)
-- `Organisation.java` (`@Table(name = "organisation")`)
-
-Именование таблиц и колонок — `snake_case`, совпадает с Liquibase-миграциями (`db/changelog/v1.0.0/<тип>/*.sql`). Первичные ключи — `UUID`, генерируются через `@GeneratedValue(strategy = GenerationType.UUID)`.
-
-- `Service`:`@Id @Column(name = "service_id") @GeneratedValue(strategy = GenerationType.UUID) private UUID serviceId;`
-- `AssetObject`:`@Id @Column(name = "asset_object_contract_position_id") @GeneratedValue(strategy = GenerationType.UUID) private UUID assetObjectId;`
-
-**Аудит и оптимистичная блокировка отсутствуют полностью.** `grep` по `@Version|@CreatedDate|@LastModifiedDate|@CreatedBy|@LastModifiedBy|@EntityListeners|@MappedSuperclass` в `objects/src/main/java` — ноль совпадений. Это соответствует GAP-данным: `08_db.version_annotation` — violation (`@Version` count=0), `08_db.created_by` — violation (`@CreatedBy`/`@LastModifiedBy` count=0), `08_db.audit_timestamps` — «compliant», но фактически поля дат создания/изменения отсутствуют (count=0) — соглашение глобального эталона про `created_date`/`changed_date` и обязательные поля не выполняется в коде.
-
-### 1.2 Связи и каскады
-
-`Service.java` — корень агрегата: содержит `@OneToMany(mappedBy = "service", cascade = CascadeType.ALL)` для `rentalObjects`, `assetObjects`, `capObjects`, `finapObjects` и `@OneToOne(mappedBy = "service", cascade = CascadeType.ALL)` для `organisation`. Вложенные сущности владеют связью:
-
-- `AssetObject`:`@ManyToOne(cascade = CascadeType.ALL) @JoinColumn(name = "service_id") private Service service;` (`mappedBy = "assetObject"` в родителе)
-
-Доступны шаблонные бинаправленные хелперы `add...(...)`, которые заполняют обратную ссылку (например `Service.addAssetObject` ставит `assetObject.setService(this)`).
-
-`Partner` и `BankAccount`: `AssetObject`/`RentalObject` держат `@OneToMany` контрагентов, `BankAccount` — `@OneToOne @JoinColumn(name = "contract_partner_id") private Partner partner;`.
-
-### 1.3 Репозитории (Spring Data JPA)
-
-Интерфейсы расположены в `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/repository/` и наследуют Spring Data:
-
-- `ServiceRepository extends JpaRepository<Service, UUID>` — содержит производный метод `List<Service> findByContractVersionId(UUID contractVersionId)` (используется поиском по версии договора).
-- `AssetObjectRepository extends JpaRepository<AssetObject, UUID>` — пустой.
-- `RentalObjectRepository extends JpaRepository<RentalObject, UUID>` — пустой.
-
-ID-тип репозиториев — `UUID` (совпадает с PK сущностей). Бизнес-логика и кастомные `@Query`/`JpaSpecificationExecutor`/pagination в репозиториях не видны.
-
-### 1.4 Таблицы и `entity ↔ SQL` соответствие
-
-Хранение разделено по типам объектов; Liquibase-changelog `db/changelog/v1.0.0/<тип>/<файл>.sql` для каждого типа. `asset_object` сопоставляется 1:1 с `AssetObject.java`:
-
-- Таблица `asset_object`, PK `asset_object_contract_position_id UUID PRIMARY KEY`.
-- FK `fg_asset_object_service` → `service(service_id)`.
-- `COMMENT ON TABLE / COMMENT ON COLUMN` заданы для таблицы и всех колонок — соответствует правилу эталона «комментарии обязательны».
-- `--rollback` присутствует в каждом changeset.
-
-Замечание: root-entity service мигрирован файлом `2026-07-28_01_init-migration-service.sql`, а `organisation` — `2026-07-20_01_init-migration.sql` (дефис), остальные типы — `2026-07-07_01_init_migration_*.sql` (snake_case) — расхождение нейминга файлов, уже отмечено в `gap_notes 03`.
-
-<!-- source: auto -->
 ## 2. Соглашения для агента
 
-- Новые сущности размещай в `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/model/entity/`, аннотируй `@Entity` + `@Table(name = "snake_case")`, PK — `UUID` c `@GeneratedValue(strategy = GenerationType.UUID)`, колонки — `@Column(name = "snake_case")`; имя таблицы/колонки должно совпадать с Liquibase-миграцией 1:1 (см. `AssetObject.java` ↔ `v1.0.0/asset_object/*.sql`).
-- Новые репозитории — интерфейсы в `repository/`, наследуй `JpaRepository<Entity, UUID>`; производные методы именуй по Spring Data (`findByContractVersionId` в `ServiceRepository`). Не добавляй `@Repository` без необходимости — Spring Data сам регистрирует bean (в репо аннотация встречается непоследовательно).
-- Связи агрегата веди от `Service` `@OneToMany(mappedBy = "service", cascade = CascadeType.ALL)` (rental/asset/cap/finap) и `@OneToOne` (organisation); владеющая сторона — на дочерней сущности через `@ManyToOne`/`@OneToOne` + `@JoinColumn`. Обязательно сохраняй бинаправленные хелперы `add*(...)`.
-- При добавлении общих полей аудита используй `@MappedSuperclass` в `model/entity/` и аннотации `@CreatedDate`/`@LastModifiedDate`/`@CreatedBy`/`@LastModifiedBy` с `@EntityListeners(AuditingEntityListener.class)` — в текущем коде аудит и `@Version` отсутствуют, это открытая зона к глобальному `rules/08_database.md`.
-- Денежные суммы в сущностях/DTO держи в `BigDecimal` (см. `ObjectsDTO.RentalObjectDTO` — `rentalObjectSquare`, `leasebackCalculationRentFairCost`, `pricePerUnit`, `balanceAmountRub`), в SQL — `numeric(16,2)` (рубли) / `numeric(18,4)` (валюта), не `float`/`double`.
-- Консистентность с миграциями БД проверяй через `03_migrations.md` (Liquibase `db/changelog`), не создавай сущность/колонку без соответствующего changeset.
+- Новую сущность размещай в `model/entity/`, репозиторий — интерфейс в `repository/`, наследующий `JpaRepository<Entity, ID>`.
+- Поле PK называй `<table>Id`, поле связи (FK) — по имени связанной сущности без суффикса `Id`; constraint FK в миграции — `fk_<referenced_table>`.
+- Новый производный query-метод с именем длиннее ~40 символов или >4 параметрами — не наращивай дальше, переходи на `@Query` с коротким именем. Новый `default`-метод репозитория — только unwrap/тривиальная проверка, без ручных циклов/`Stream`-фильтрации и без бизнес-логики.
+- Связи задавай `LAZY` явно на `@ManyToOne`/`@OneToOne`; `EAGER` — только с обоснованием в комментарии.
+- Каскад `ALL`/`REMOVE` — только от родителя к владеемым дочерним сущностям без самостоятельного жизненного цикла; на обратной стороне (`@ManyToOne`) каскад не ставь.
+- Для новых изменяемых сущностей добавляй `@Version`, если возможен конкурентный апдейт из разных запросов.
+- Для списковых/детальных выборок с известными связями — пиши `@Query` с `JOIN FETCH` или используй `@EntityGraph`, проверяй фактическое число SQL-запросов на логировании (`spring.jpa.show-sql`/p6spy) при добавлении нового запроса с связями.
+- Списковый repository-метод — `Page`/`Slice` + `Pageable`, не `List` без ограничения; `JOIN FETCH` коллекции не комбинируй с `Pageable` в одном запросе (ловушка постраничной выборки в памяти).
+- `@Modifying`-запрос — всегда с `clearAutomatically = true`.
+- `@Transactional` ставь на публичном методе сервиса, не на `repository`/`controller`; чтение — `readOnly = true`; внутри транзакции не вызывай внешние HTTP/Kafka-интеграции.
+- Новую сущность с ожидаемой высокочастотной вставкой на большую таблицу — не выбирай случайный `UUID` PK не глядя; проверь, не нужен ли time-ordered генератор или `BIGINT`+`SEQUENCE`.
+- `OptimisticLockException`/`ObjectOptimisticLockingFailureException` на уровне `@RestControllerAdvice` — маппи в `409`, не оставляй как необработанный `500`.
+- Не отдавай JPA-сущность напрямую в HTTP-ответ — только через DTO/маппер (см. `07_api_contract.md`).
 
-<!-- source: auto -->
 ## 3. Чек-лист
 
-- [ ] JPA entity использует правильные аннотации маппинга: `@Entity`, `@Table(name=snake_case)`, `@Id`+`@GeneratedValue(UUID)`, `@Column(name=snake_case)`
-- [ ] Repository наследует `JpaRepository<Entity, UUID>` (ID-тип совпадает с PK)
-- [ ] Именование таблиц/колонок в entity совпадает с Liquibase-миграциями 1:1
-- [ ] Каскады и fetch-стратегии заданы явно (`cascade = CascadeType.ALL`, `mappedBy`/`@JoinColumn`)
-- [ ] N+1 проблемы проверены (JOIN FETCH или EntityGraph при необходимости)
-- [ ] `@Version` добавлен на ключевые сущности при необходимости оптимистичной блокировки (сейчас отсутствует — расхождение с `rules/08_database.md`)
-- [ ] Поля аудита (`created_date`/`changed_date` + `*_by`) и `@EntityListeners(AuditingEntityListener.class)` добавлены, если требуется отслеживание изменений
-- [ ] Денежные поля объявлены как `BigDecimal` (SQL `numeric(16,2)`/`numeric(18,4)`), без плавающей точки
-- [ ] Для новых таблиц/колонок есть `COMMENT ON` и `--rollback` в соответствующем changeset
-- [ ] Нет выдуманных соответствий SQL↔Java: каждая колонка сущности подтверждена DDL миграции
+- [ ] `@Entity`/`@Table`/`@Id`+`@GeneratedValue` заданы, имена совпадают с миграцией
+- [ ] Именование PK/FK соблюдено (`<table>Id`/`<table>_id`, поле связи без суффикса `Id`, constraint `fk_<referenced_table>`)
+- [ ] Длинные производные query-методы (>~40 символов/>4 параметров) заменены на `@Query`; `default`-методы репозитория не содержат ручных циклов/`Stream`-фильтрации и бизнес-логики
+- [ ] Связи — `LAZY` по умолчанию, `EAGER` обоснован явно
+- [ ] Каскад `ALL`/`REMOVE` — только родитель → дочерние сущности без своего жизненного цикла
+- [ ] `@Version` добавлен там, где возможен конкурентный апдейт
+- [ ] Аудит-поля (`@CreatedDate`/`@LastModifiedDate`) — на изменяемых сущностях
+- [ ] Запросы с известными связями используют `JOIN FETCH`/`@EntityGraph`, N+1 проверен
+- [ ] Списковые repository-методы возвращают `Page`/`Slice`, не неограниченный `List`
+- [ ] `JOIN FETCH` коллекции не скомбинирован с `Pageable` в одном запросе
+- [ ] `@Modifying`-запросы — с `clearAutomatically = true`
+- [ ] `@Transactional` — на сервисе, `readOnly = true` на читающих методах, без внешних вызовов внутри транзакции
+- [ ] `OptimisticLockException` транслируется в `409`, не утекает как `500`
+- [ ] `spring.jpa.open-in-view=false`, ленивая загрузка не происходит в контроллере
+- [ ] Денежные поля — `BigDecimal`, не `double`/`float`
 
-<!-- source: auto -->
-## 4. Примеры из кода
-
-### Example 1: `AssetObject.java` ↔ `2026-07-07_01_init_migration_asset_object.sql`
-
-**Path:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/model/entity/AssetObject.java`
+## 4. Примеры кода
 
 ```java
 @Entity
-@Table(name = "asset_object")
-public class AssetObject {
+@Table(name = "orders")
+@Getter @Setter
+public class Order {
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
-    @Column(name = "asset_object_contract_position_id")
-    private UUID assetObjectId;
+    private UUID id;
 
-    @ManyToOne(cascade = CascadeType.ALL)
-    @JoinColumn(name = "service_id")
-    private Service service;
+    @Version
+    private Long version;
 
-    @OneToMany(mappedBy = "assetObject", cascade = CascadeType.ALL)
-    private List<Partner> partners;
+    @Enumerated(EnumType.STRING)
+    private OrderStatus status;
+
+    @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<OrderLine> lines = new ArrayList<>();
+
+    @CreatedDate
+    private Instant createdAt;
 }
-```
 
-**Path:** `objects/src/main/resources/db/changelog/v1.0.0/asset_object/2026-07-07_01_init_migration_asset_object.sql`
-
-```sql
-CREATE TABLE IF NOT EXISTS asset_object (
-    asset_object_contract_position_id UUID PRIMARY KEY,
-    ...
-    service_id UUID,
-    CONSTRAINT fg_asset_object_service FOREIGN KEY (service_id) REFERENCES service (service_id)
-);
-COMMENT ON TABLE asset_object IS '(OC объекты по договору';
-```
-
-Entity и DDL согласованы: PK `asset_object_contract_position_id` = `assetObjectId`, FK `service_id` = `@JoinColumn(name = "service_id")`.
-
-### Example 2: `Service.java` — корень агрегата и `ServiceRepository`
-
-**Path:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/model/entity/Service.java`
-
-```java
-@Table(name = "service")
 @Entity
-public class Service {
-    @Id @GeneratedValue(strategy = GenerationType.UUID)
-    @Column(name = "service_id")
-    private UUID serviceId;
+@Table(name = "order_lines")
+@Getter @Setter
+public class OrderLine {
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
 
-    @OneToMany(mappedBy = "service", cascade = CascadeType.ALL)
-    private List<AssetObject> assetObjects;
-    @OneToOne(mappedBy = "service", cascade = CascadeType.ALL)
-    private Organisation organisation;
+    @ManyToOne(fetch = FetchType.LAZY)          // без cascade — дочерняя сторона не каскадирует к родителю
+    @JoinColumn(name = "order_id")
+    private Order order;
 }
 ```
-
-**Path:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/repository/ServiceRepository.java`
 
 ```java
-@Repository
-public interface ServiceRepository extends JpaRepository<Service, UUID> {
-    List<Service> findByContractVersionId(UUID contractVersionId);
+public interface OrderRepository extends JpaRepository<Order, UUID> {
+
+    @EntityGraph(attributePaths = "lines")
+    Optional<Order> findWithLinesById(UUID id);          // без Pageable — JOIN FETCH коллекции + пагинация считались бы в памяти
+
+    Page<Order> findByStatus(OrderStatus status, Pageable pageable);   // список — всегда Page/Slice, не List
+
+    @Modifying(clearAutomatically = true)
+    @Query("UPDATE Order o SET o.status = :status WHERE o.id IN :ids")
+    int bulkUpdateStatus(@Param("ids") List<UUID> ids, @Param("status") OrderStatus status);
+
+    default Order getByIdOrThrow(UUID id) {                  // default-метод: только unwrap, без бизнес-логики
+        return findById(id).orElseThrow(() -> new EntityNotFoundException(id));
+    }
 }
 ```
 
-<!-- source: auto -->
-## 5. Исключения и оговорки
+```java
+@Service
+@RequiredArgsConstructor
+public class OrderServiceImpl implements OrderService {
 
-- Соглашение о JPA/Auditing из глобального `rules/08_database.md` (обязательные `created_date`/`changed_date`, `@CreatedDate`/`@LastModifiedDate`, `@Version`, `@MappedSuperclass`) в текущем коде фактически не реализовано — audit-поля и optimistic locking отсутствуют. Локальное правило: следуй глобальному эталону при добавлении новых сущностей, пока аудит/версионирование не внедрено.
-- Именование многих-ко-многим через `имя1_имя2_lnk` (таблицы-линки) в репозитории не используется — связи строятся только через `@JoinColumn` на дочерней стороне (FK `service_id`, `contract_partner_id`).
-- Имена файлов-миграций неоднородны (`init-migration` дефис в service/organisation vs `init_migration` snake_case у остальных) — зафиксировано в `gap_notes 03` и `03_migrations.md`.
+    private final OrderRepository orderRepository;
 
-<!-- source: auto -->
-## 6. Обновление
+    @Transactional(readOnly = true)
+    public OrderResponse getOrder(UUID id) {
+        return mapper.toResponse(orderRepository.findWithLinesById(id)
+                .orElseThrow(() -> new EntityNotFoundException(id)));
+    }
 
-Пересобирать при крупном рефакторинге модели (`model/entity`), массовом добавлении/удалении таблиц в `db/changelog/v1.0.0/`, внедрении аудита (`@MappedSuperclass`/`@EntityListeners`) или optimistic locking (`@Version`).
+    @Transactional
+    public void cancelOrder(UUID id) {                       // транзакция только вокруг БД
+        var order = orderRepository.findById(id).orElseThrow(() -> new EntityNotFoundException(id));
+        order.setStatus(OrderStatus.CANCELLED);
+    }
+}
+
+@Service
+@RequiredArgsConstructor
+public class OrderCancellationOrchestrator {                // не @Transactional — оркестрирует шаги, не сам меняет БД
+
+    private final OrderService orderService;
+    private final ShippingClient shippingClient;
+
+    public void cancel(UUID id) {
+        orderService.cancelOrder(id);                        // отдельный бин — вызов идёт через прокси, транзакция реально применяется
+        shippingClient.notifyCancellation(id);               // вне транзакции — внешний вызов не удерживает соединение/лок
+    }
+}
+```
+
+## 5. Когда пересматривать
+
+При массовом рефакторинге модели данных, появлении первых проблем N+1 в проде, изменении политики каскадов/аудита, либо при пересмотре подхода к пагинации/bulk-операциям или границам транзакций.

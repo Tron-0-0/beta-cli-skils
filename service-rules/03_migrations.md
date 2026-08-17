@@ -3,230 +3,115 @@ apply: always
 mode: all
 ---
 
-<!-- source: auto -->
-# Соглашение: Миграции БД (Liquibase и т.д.) (profitcontr-objects)
+# Соглашение: Миграции БД (Liquibase/Flyway)
 
-**Когда читать:** При изменении схемы БД, добавлении миграций, или review миграционных скриптов.
+**Когда читать:** при изменении схемы БД, добавлении миграций, review миграционных скриптов.
 
-**Что описывает:** Liquibase changelog, версионирование, структура папок таблиц, rollback.
-
-**Глобальный эталон:** `rules/03_migrations.md`
+**Что описывает:** версионирование changelog, формат SQL-файлов, правила безопасного изменения схемы.
 
 ---
 
-<!-- source: auto -->
-## 1. Наблюдения в репозитории
+## 1. Правило
 
-### 1.1 Корневой master changelog
+- **Инструмент** — Liquibase или Flyway, один на проект, не смешивать в рамках репозитория. Механика подключения миграций у них разная:
+  - **Liquibase** — master-changelog подключает версионные/датированные подфайлы через `include`/`includeAll`, сам не хранит DDL напрямую; имя файла подфайла свободное.
+  - **Flyway** — отдельного master-файла нет, миграции обнаруживаются автоматически по строгому формату имени `V{version}__description.sql` (обязательны префикс `V` и двойное подчёркивание); версия новой миграции не может быть меньше уже применённой.
+- **Версионирование** — единая для всего репозитория схема:
+  - по версии релиза (`v1.2.0/...`) — когда деплой синхронизирован с релизными тегами;
+  - по монотонной дате+порядку — для Liquibase свободное имя файла (например `2026-08-10_01_add_index.sql`), для Flyway обязательный формат инструмента (например `V20260810.01__add_index.sql`).
+- **Immutability применённых миграций:** уже применённый (закоммиченный и выкаченный) changeset **не редактируется** — любое исправление идёт новым changeset. Редактирование применённого changeset ломает checksum-валидацию и рассинхронизирует состояние сред.
+- **Формат файла** — заголовок инструмента, уникальный `changeset id`, тело DDL, `--rollback` секция (Liquibase) или отдельный undo-скрипт. Каждая новая таблица и колонка сопровождается `COMMENT ON`/аналогом — самодокументируемая схема. Для разрушающих изменений (например `DROP COLUMN`) `--rollback` восстанавливает только структуру, а не удалённые данные — это best-effort/документация факта отката, а не гарантия полного восстановления.
+- **Zero-downtime (expand/contract):** изменения, несовместимые со старой версией приложения (удаление/переименование колонки, смена типа с потерей совместимости), разбиваются на фазы, совместимые со старой и новой версией приложения одновременно:
+  1. **Expand** — добавить новое (новую колонку/таблицу), не трогая старое.
+  2. Задеплоить код, который пишет в оба места / читает с fallback.
+  3. Backfill данных отдельной миграцией (вне транзакции DDL, батчами для больших таблиц).
+  4. **Contract** — удалить старое только после того, как все инстансы приложения переведены на новую схему.
+- **Ограничения (`NOT NULL`/`FOREIGN KEY`/`CHECK`) на существующей большой таблице** — не через блокирующий `ALTER TABLE ... ADD CONSTRAINT`, а двумя миграциями: добавить constraint как `NOT VALID` (не блокирует запись и не сканирует таблицу), затем отдельной миграцией `VALIDATE CONSTRAINT` (сканирует существующие строки, но не блокирует конкурентные `INSERT`/`UPDATE`) — паттерн PostgreSQL. Для СУБД без `NOT VALID` — предварительный батчевый backfill/проверка данных перед добавлением constraint.
+- **Индексы на больших таблицах** — создавать без блокировки записи (`CREATE INDEX CONCURRENTLY` в PostgreSQL) там, где это поддерживается СУБД.
+- **Seed/справочные данные (reference data)** — если миграция сеет данные, это отдельный idempotent DML-скрипт (`INSERT ... ON CONFLICT DO NOTHING`/`MERGE`), не смешанный с DDL в одном changeset. Окружение-специфичные данные (тестовые/staging) в общий репозиторий не коммитятся.
+- **Имя FK-constraint** — `fk_<referenced_table>` (согласовано с именованием связей в `08_database.md`).
 
-Liquibase настроен в `objects/src/main/resources/application.properties`:
-- `spring.liquibase.change-log=classpath:/db/changelog/0001_changelog.xml`
-- `spring.liquibase.enabled=${LIQUIBASE_ENABLED:false}` — по умолчанию выключено, включается переменной окружения
-- `spring.liquibase.default-schema=${DB_SCHEMA}` — схема из окружения
+## 2. Соглашения для агента
 
-Корневой changelog `objects/src/main/resources/db/changelog/0001_changelog.xml` содержит `<include>` на версионный `changelog.xml`:
+1. Перед новой миграцией проверь, не редактируешь ли уже применённый changeset — если данные/структура уже выкачены, создавай новый файл.
+2. Изменения, несовместимые со старой версией приложения (rename/remove колонки, смена типа с потерей совместимости) — только через expand/contract, не одним DDL-скриптом с одновременным удалением старого.
+3. `NOT NULL`/`FOREIGN KEY`/`CHECK` на существующую большую таблицу — через `ADD CONSTRAINT ... NOT VALID` + отдельную последующую миграцию `VALIDATE CONSTRAINT`, не единым блокирующим DDL.
+4. На новую таблицу/колонку — обязательный комментарий и `--rollback`; для разрушающих изменений явно понимай, что rollback данных не восстанавливает.
+5. Крупный backfill — отдельным батч-скриптом/джобой, не одной транзакцией на миллионы строк (риск лока и long-running transaction).
+6. Не меняй тип колонки, если это требует полной перезаписи таблицы, без согласования — на больших таблицах это может занять часы и заблокировать запись.
+7. Seed/справочные данные добавляй отдельным idempotent DML-скриптом (`ON CONFLICT DO NOTHING`/`MERGE`), не смешивай с DDL в одном changeset; окружение-специфичные данные в репозиторий не коммить.
 
-```xml
-<include file="/v1.0.2/changelog.xml" relativeToChangelogFile="true"/>
+## 3. Чек-лист
+
+- [ ] Changeset уникален по id, включён в master-changelog (Liquibase) или именован по формату инструмента (Flyway)
+- [ ] На новую таблицу/колонку есть `COMMENT ON`
+- [ ] Есть `--rollback`/undo-скрипт; для разрушающих изменений явно понятно, что данные им не восстанавливаются
+- [ ] Изменение, несовместимое со старой версией приложения (rename/remove/смена типа), разбито на expand/contract-фазы, а не в один шаг
+- [ ] `NOT NULL`/`FK`/`CHECK` на существующей большой таблице добавлены через `NOT VALID` + отдельную `VALIDATE CONSTRAINT`, без блокировки записи
+- [ ] Уже применённый changeset не редактируется задним числом
+- [ ] Индекс на большой таблице создаётся без блокировки записи, если СУБД поддерживает
+- [ ] Seed/справочные данные — отдельным idempotent DML-скриптом, не смешаны с DDL
+- [ ] Имя FK-constraint — `fk_<referenced_table>`
+- [ ] Изменение обратно совместимо с предыдущей версией приложения (для rolling deploy)
+
+## 4. Примеры кода
+
+```sql
+--liquibase formatted sql
+--changeset team:2026-08-10_01_add_order_priority
+
+ALTER TABLE orders ADD COLUMN priority SMALLINT;
+COMMENT ON COLUMN orders.priority IS 'Приоритет обработки заказа, 1-5';
+--rollback ALTER TABLE orders DROP COLUMN priority;
 ```
 
-### 1.2 Версионирование: версия = версия проекта из pom.xml
+Expand/contract при переименовании колонки `amount` → `total_amount`:
 
-Папки версий в `db/changelog/` соответствуют **текущей версии проекта** из `<version>` в `pom.xml` (например `1.0.2-SNAPSHOT` → папка `v1.0.2/`). При обновлении версии проекта создаётся новая папка версии (например `v1.0.3/`), а старая не удаляется.
+```sql
+-- Фаза 1 (expand): добавить новую колонку, приложение пишет в обе
+--changeset team:2026-08-10_01_expand_total_amount
+ALTER TABLE orders ADD COLUMN total_amount NUMERIC(18,2);
+--rollback ALTER TABLE orders DROP COLUMN total_amount;
 
-Версионный `changelog.xml` (например `v1.0.2/changelog.xml`) подключает папки таблиц, которые затронуты в этой версии:
-
-```xml
-<databaseChangeLog ... logicalFilePath="v1.0.2">
-    <include file="service/2026-07-28_01_init-migration-service.sql" relativeToChangelogFile="true"/>
-    <include file="partner/2026-07-07_02_add-new-column.sql" relativeToChangelogFile="true"/>
-</databaseChangeLog>
+-- Фаза 2: backfill отдельной миграцией/джобой (батчами)
+-- Фаза 3 (contract, отдельный релиз после полного перехода): удалить старую колонку
+--changeset team:2026-09-01_01_contract_amount
+ALTER TABLE orders DROP COLUMN amount;
+--rollback ALTER TABLE orders ADD COLUMN amount NUMERIC(18,2);
 ```
 
-### 1.3 Папки таблиц: только для затронутых в данной версии
+`NOT NULL` на существующей большой таблице без блокировки записи (PostgreSQL):
 
-Внутри каждой версии (`v{version}/`) находятся **папки имён таблиц**, для которых в этой версии есть изменения. Если таблица не затронута в данной версии — **её папки в этой версии нет**.
+```sql
+-- Миграция 1: добавить constraint как NOT VALID — не блокирует запись, не сканирует таблицу
+--changeset team:2026-08-10_02_add_priority_not_null_constraint
+ALTER TABLE orders ADD CONSTRAINT priority_not_null CHECK (priority IS NOT NULL) NOT VALID;
+--rollback ALTER TABLE orders DROP CONSTRAINT priority_not_null;
 
-Пример: если v1.0.2 меняет только `service` и добавляет колонку в `partner`, то в `v1.0.2/` будут папки `service/` и `partner/`, но не будет `asset_object/`, `rental_object/` и т.д.
+-- Миграция 2 (отдельная, после backfill существующих строк): валидация без блокировки конкурентных INSERT/UPDATE
+--changeset team:2026-08-10_03_validate_priority_not_null_constraint
+ALTER TABLE orders VALIDATE CONSTRAINT priority_not_null;
+```
+
+Опциональный, более строгий вариант организации каталогов (не отменяет свободу выбора имени подфайла из §1, а один из вариантов, если команда хочет более жёсткую структуру): папка на каждую релизную версию, внутри — подпапка на каждую таблицу, изменённую в этой версии; `changeset id` = имя файла миграции (без расширения) + имя таблицы — глобально уникален не только в рамках одного changelog-файла:
 
 ```
 db/changelog/
-├── 0001_changelog.xml
-├── v1.0.0/
-│   ├── changelog.xml
-│   ├── service/
-│   ├── asset_object/
-│   ├── rental_object/
-│   ├── organisation/
-│   ├── partner/
-│   └── bank_account/
-├── v1.0.1/
-│   ├── changelog.xml
-│   ├── service/          ← добавлена новая колонка
-│   └── partner/          ← добавлен новый индекс
-└── v1.0.2/
-    ├── changelog.xml
-    └── cap_object/       ← создана новая таблица
+├── db.changelog-master.xml
+└── v1.2.0/
+    ├── changelog-v1.2.0.xml            # include на миграции этой версии
+    └── orders/
+        └── 2026-08-10_01_add_priority.sql
 ```
-
-### 1.4 Формат SQL-файлов
-
-Каждый DDL-файл — Liquibase `formatted SQL`:
-- Хедер: `--liquibase formatted sql`
-- Changeset: `--changeset id:<имя_файла>`
-- Тело на SQL (CREATE TABLE / ALTER TABLE / CREATE INDEX / COMMENT)
-- Завершается: `--rollback`
-
-**Обязательные комментарии:** на каждую новую таблицу и на каждую новую колонку — `COMMENT ON`. Без комментариев на новые таблицы/колонки changeset не принимается.
-
-Пример:
 
 ```sql
 --liquibase formatted sql
---changeset id:v1.0.2_01_add-index-partner
+--changeset id:2026-08-10_01_add_priority_orders
 
-CREATE INDEX IF NOT EXISTS idx_partner_accounting_code ON partner (accounting_code);
-COMMENT ON COLUMN partner.accounting_code IS 'Код учётного предмета';
---rollback DROP INDEX IF EXISTS idx_partner_accounting_code;
+ALTER TABLE orders ADD COLUMN priority SMALLINT;
+--rollback ALTER TABLE orders DROP COLUMN priority;
 ```
 
-### 1.5 ФМД (физическая модель данных)
+## 5. Когда пересматривать
 
-Каждая новая таблица или колонка в миграции должна соответствовать утверждённой ФМД. Файл `fdm-attributes.json` и плагин `core-fdm-plugin` пока не подключены — контроль осуществляется ручным ревью чейнджлогов. При подключении FDM-валидатора следуй `rules/15_fdm_plugin.md`.
-
----
-
-<!-- source: auto -->
-## 2. Соглашения для агента
-
-### 2.1 Новая мажорная/минорная версия
-
-1. Определи новую версию из `<version>` в `pom.xml` (например `1.0.3-SNAPSHOT` → `v1.0.3/`).
-2. Создай каталог `db/changelog/v{version}/` и файл `changelog.xml` внутри:
-   ```xml
-   <databaseChangeLog ... logicalFilePath="v{version}">
-       <!-- include по затронутым таблицам -->
-   </databaseChangeLog>
-   ```
-3. Добавь `<include>` для версионного changelog в `0001_changelog.xml` (если старая версия была с другой версией):
-   ```xml
-   <include file="/v1.0.3/changelog.xml" relativeToChangelogFile="true"/>
-   ```
-4. Не удаляй старые версионные папки (`v1.0.0/`, `v1.0.1/` и т.д.) — они часть истории миграций.
-
-### 2.2 Новая миграция для существующей версии
-
-Если версия ещё не выпущена (например `v1.0.2` активна, но не закоммичена как релиз):
-
-1. Создай папку таблицы (если её ещё нет в этой версии):
-   ```
-   db/changelog/v1.0.2/<таблица>/
-   ```
-2. Создай SQL-файл в формате: `<YYYY-MM-DD>_<NN>_<описание>.sql`
-3. Добавь `<include>` в `v{version}/changelog.xml` с `relativeToChangelogFile="true"`.
-4. Файл должен содержать `--rollback` (симметрично DDL).
-5. **Каждую новую таблицу и каждую новую колонку — `COMMENT ON`.** Без комментариев на новые таблицы/колонки changeset не принимается.
-
-### 2.3 Новая мажорная версия схемы
-
-Если схема БД существенно меняется (пересоздание, разделение на части):
-
-1. Создай новую папку версии `v{next_major}/` (например `v2.0.0/`).
-2. Включи в `0001_changelog.xml` новую версию:
-   ```xml
-   <include file="/v2.0.0/changelog.xml" relativeToChangelogFile="true"/>
-   ```
-3. В `v2.0.0/changelog.xml` — include для **всех** таблиц модели данных.
-
----
-
-<!-- source: auto -->
-## 3. Чек-лист
-
-- [ ] Версия папки changelog соответствует версии проекта из `pom.xml` (`v{major}.{minor}.{patch}`)
-- [ ] Новая миграция добавлена в `<include>` версионного `changelog.xml` (`relativeToChangelogFile="true"`)
-- [ ] Папка таблицы есть в версии только если миграция её затрагивает
-- [ ] SQL-файл содержит `--rollback` (симметрично DDL: DROP → CREATE)
-- [ ] Имя файла уникально: `<YYYY-MM-DD>_<NN>_<описание>.sql`
-- [ ] **На каждую новую таблицу и каждую новую колонку есть `COMMENT ON`** — без комментариев changeset не принимается
-- [ ] Изменения совместимы с предыдущей версией (backward compatible)
-- [ ] Миграция соответствует ФМД (утверждённый перечень атрибутов)
-
----
-
-<!-- source: auto -->
-## 4. Примеры из кода
-
-### Example 1: Корневой changelog 0001_changelog.xml
-
-**Путь:** `objects/src/main/resources/db/changelog/0001_changelog.xml`
-
-```xml
-<databaseChangeLog
-        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
-        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.4.xsd"
-        logicalFilePath="path-independent">
-    <include file="/v1.0.2/changelog.xml" relativeToChangelogFile="true"/>
-</databaseChangeLog>
-```
-
-### Example 2: Версионный changelog v1.0.2
-
-**Путь:** `objects/src/main/resources/db/changelog/v1.0.2/changelog.xml`
-
-```xml
-<databaseChangeLog
-        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
-        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
-        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.4.xsd"
-        logicalFilePath="v1.0.2">
-    <include file="service/2026-07-28_01_init-migration-service.sql" relativeToChangelogFile="true"/>
-    <include file="partner/2026-07-07_01_init_migration_partner.sql" relativeToChangelogFile="true"/>
-</databaseChangeLog>
-```
-
-### Example 3: SQL-миграция новой таблицы
-
-**Путь:** `objects/src/main/resources/db/changelog/v1.0.2/cap_object/2026-08-06_01_init_migration_cap_object.sql`
-
-```sql
---liquibase formatted sql
---changeset id:2026-08-06_01_init_migration_cap_object
-
-CREATE TABLE IF NOT EXISTS cap_object (
-    cap_object_id         UUID PRIMARY KEY,
-    service_id            UUID NOT NULL,
-    description           VARCHAR(500),
-    CONSTRAINT fg_cap_object_service FOREIGN KEY (service_id) REFERENCES service (service_id)
-);
-COMMENT ON TABLE cap_object IS 'Капитальные вложения';
-COMMENT ON COLUMN cap_object.cap_object_id IS 'Идентификатор капвложения';
-COMMENT ON COLUMN cap_object.service_id IS 'Идентификатор родительской услуги';
---rollback DROP INDEX IF EXISTS idx_cap_object_service;
---rollback DROP TABLE IF EXISTS cap_object;
-```
-
----
-
-<!-- source: auto -->
-## 5. Исключения и оговорки
-
-- Старые версионные папки (`v1.0.0/`, `v1.0.1/` и т.д.) **не удаляются** — они часть истории миграций и применяются Liquibase по порядку.
-- Если версия проекта обновляется (например `1.0.2-SNAPSHOT` → `1.0.3-SNAPSHOT`), создаётся новая папка `v1.0.3/`. Старая `v1.0.2/` остаётся.
-- В `COMMENT ON TABLE asset_object` в старых миграциях видны незакрытые скобки (`'(OC объекты по договор'`) — в новых миграциях проверяй синтаксис.
-- **Комментарии обязательны:** `COMMENT ON` нужен на каждую новую таблицу и каждую новую колонку. Это не опция, а блокирующее требование — changeset без комментариев не принимается.
-- Автор (`--changeset id:author:filename`) не проставляется локально — факт, не нарушение.
-
----
-
-<!-- source: auto -->
-## 6. Обновление
-
-Пересобирать при:
-- Смене версии проекта в `pom.xml` (создание новой папки `v{version}/`)
-- Добавлении/изменении таблиц в существующей версии
-- Появлении новой мажорной версии схемы (v2, v3)
-- Подключении FDM-валидатора (следовать `rules/15_fdm_plugin.md`)
+При смене инструмента миграций, переходе на другую схему версионирования, либо при систематических проблемах с даунтаймом деплоев из-за разрушающих изменений схемы.

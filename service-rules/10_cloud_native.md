@@ -3,117 +3,70 @@ apply: always
 mode: all
 ---
 
-<!-- source: auto -->
-# Соглашение: Cloud Native, probes, health (profitcontr-objects)
+# Соглашение: Cloud Native, probes, graceful shutdown
 
-**Когда читать:** При деплое/контейнеризации сервиса, настройке probe-эндпоинтов или включении/правке actuator и метрик OTLP.
+**Когда читать:** при деплое/контейнеризации сервиса, настройке probe-эндпоинтов, подготовке к работе под оркестратором (Kubernetes и аналоги).
 
-**Что описывает:** наблюдаемые в репозитории настройки Spring Boot Actuator (`management.*`), readiness/liveness/startup probes, метрики/трейсинг OpenTelemetry; глобальный регламент — `rules/10_cloud_native.md`.
-
-**Глобальный эталон:** `rules/10_cloud_native.md`
+**Что описывает:** liveness/readiness/startup probes, graceful shutdown, поведение JVM в контейнере, 12-factor конфигурацию.
 
 ---
 
-<!-- source: auto -->
-## 1. Наблюдения в репозитории
+## 1. Правило
 
-### 1.1 Spring Boot Actuator и probe-эндпоинты
+- **Probes раздельны:** `liveness` — только "процесс жив, event loop не завис" (см. `02_monitors.md`); `readiness` — учитывает состояние критичных внешних зависимостей; `startup` — для сервисов с долгой инициализацией, чтобы не убивать процесс liveness-проверкой во время старта.
+- **Graceful shutdown обязателен:** на `SIGTERM` (что оркестратор посылает перед остановкой пода) сервис перестаёт принимать новый трафик, но доводит до конца уже начатые запросы в течение ограниченного окна (`server.shutdown=graceful`, `spring.lifecycle.timeout-per-shutdown-phase`). Без этого rolling-деплой обрывает запросы в процессе обработки. **Эта настройка покрывает только встроенный веб-сервер** — фоновая работа с собственным жизненным циклом (`ThreadPoolTaskExecutor`/`@Async`, Kafka listener containers, `@Scheduled`-задачи) должна быть донастроена отдельно, иначе SIGTERM обрывает её мгновенно вместе с контекстом приложения, несмотря на настроенный graceful shutdown HTTP-слоя.
+- **Readiness при остановке — не мгновенный.** Между тем, как readiness переходит в `DOWN`/`REFUSING_TRAFFIC`, и тем, как оркестратор перестаёт направлять трафик на под, есть задержка распространения (обновление списка эндпоинтов/балансировщика) — часть запросов может прийти уже после начала остановки. Окно graceful shutdown должно быть с запасом на эту задержку, а не впритык под среднюю длительность запроса; если манифесты в зоне ответственности репозитория — компенсируется `terminationGracePeriodSeconds`/`preStop`-хуком, здесь фиксируется только то, что приложенческий таймаут не должен быть равен нулю в расчёте на мгновенное прекращение трафика.
+- **Сервис — stateless.** Состояние сессии/кэш, критичный для повторного запроса, не хранится в памяти инстанса — иначе рестарт/масштабирование теряют данные и ломают балансировку между репликами.
+- **12-factor конфигурация:** всё окружение через переменные окружения (см. `12_configuration.md`), не файлы, специфичные для конкретной машины/контейнера.
+- **JVM осведомлена о лимитах контейнера:** heap задаётся относительно memory limit контейнера (`-XX:MaxRAMPercentage`), а не абсолютным значением, рассчитанным на другую машину — иначе OOMKilled контейнера при формально "штатной" работе JVM.
+- **Логи — в stdout/stderr**, не в файл внутри контейнера — файловая система пода эфемерна, сбор логов делает платформа/сайдкар; формат и содержимое лога — см. `09_logging.md`.
 
-`spring-boot-starter-actuator` объявлен в `objects/pom.xml`. В `objects/src/main/resources/application.properties` настроены probe-эндпоинты:
-
-- `management.endpoint.health.probes.enabled=true` — readiness/liveness включены принудительно (не только в Kubernetes).
-- `management.endpoint.startup.enabled=true` — включён startup.
-- `management.endpoints.web.exposure.include=startup,health,info,metrics,env` — exposed список включает **оба** `startup` и `health` (требование эталона `rules/10` соблюдено).
-
-Сервис анкерно позиционируется как cloud-native слой probes: он сконфигурирован, но готов при использовании инфраструктурой (Kubernetes/etc).
-
-### 1.2 Точка входа и startup probe
-
-`objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/WebApplication.java` конфигурирует startup через `BufferingApplicationStartup` (капсулируется через `WebApplicationConstants.APPLICATION_STARTUP_BUFFER_CAPACITY`) — ровно так, как требует эталон для startup probe (предотвращает преждевременные liveness/readiness).
-
-### 1.3 Метрики и трассировка
-
-- В `objects/pom.xml`: `micrometer-registry-otlp`, `spring-boot-starter-opentelemetry`, `feign-micrometer`.
-- `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/OpenTelemetryConfig.java` идёт под `@ConditionalOnBooleanProperty("management.otlp.metrics.export.enabled")` и добавляет `MeterFilter`: префикс имени метрики из CI, теги `app`/`pod`/`stand`.
-- Экспорт в `application.properties`: `management.otlp.metrics.export.url=${OPENTELEMETRY_EXPORT_URL}`, `step=30s`, `enabled=${OPENTELEMETRY_ENABLED:true}`.
-- Кастомные бизнес-метрики (`MeterRegistry`/`Counter`/`Timer`) и кастомные `HealthIndicator` в `src/main/java` **отсутствуют** (count=0) — открытая зона к `rules/10` (рекомендация §2).
-
-### 1.4 Kubernetes / Docker / Helm — НЕ ОПРЕДЕЛЕНО
-
-В репозитории **нет** `Dockerfile`, `kubernetes/`, `helm/`, `*deployment*.yml`-манифестов. Поэтому локальные K8s/Docker-практики не заявляются и переноситься из других проектов не должны — при отсутствии локальных манифестов следовать `rules/10_cloud_native.md`.
-
----
-
-<!-- source: auto -->
 ## 2. Соглашения для агента
 
-- Probe-эндпоинты настраивать через `management.endpoint.health.probes.enabled=true`; при включении startup обязательно перечислять `startup` и `health` в `management.endpoints.web.exposure.include` (`objects/src/main/resources/application.properties`) — правило уже соблюдается.
-- Для cloud-native задач всегда подключать `spring-boot-starter-actuator` (как в `objects/pom.xml`), а метрики/трейсинг — через `micrometer-registry-otlp` + OpenTelemetry config в `objects/.../configuration/OpenTelemetryConfig.java`; новые счётчики/гистограммы добавлять через `MeterRegistry`/`MeterFilter` в этом же конфиге.
-- Не заявлять и не "придумывать" Kubernetes/Docker/Helm-практики и манифесты: в репо (`objects/`, корень) их нет — при отсутствии локальных манифестов следовать глобальному `rules/10_cloud_native.md` (endpoints `/actuator/health/liveness`, `/actuator/health/readiness`, `/actuator/startup`).
-- **Рекомендация (открытая зона):** добавлять кастомные `AbstractHealthIndicator`/`HealthIndicator` для критических внешних зависимостей (MDM/БД/Feign-клиенты) — сейчас таких индикаторов нет; готовим при необходимости, без ломки `health` статусов по умолчанию.
-- Graceful shutdown настраивать через `server.shutdown=graceful` (сейчас в `application.properties` не задано — добавлять при потребности длительной доработки фоновых задач).
+- При включении probes — всегда разделяй `liveness` и `readiness` группы (`management.endpoint.health.group.*`), не используй единственный агрегированный `/health` для обоих случаев.
+- Настраивай `server.shutdown=graceful` и разумный таймаут (`spring.lifecycle.timeout-per-shutdown-phase`, обычно 20-30s) при первом деплое под оркестратор, если этого ещё нет; таймаут закладывай с запасом сверх средней длительности запроса — на задержку обновления балансировщика/эндпоинтов после перехода readiness в `DOWN`.
+- При добавлении собственного `ThreadPoolTaskExecutor`/`@Async`-конфигурации, Kafka-листенера или `@Scheduled`-задачи — донастраивай их собственное graceful-завершение (`setWaitForTasksToCompleteOnShutdown`/`setAwaitTerminationSeconds` у экзекутора, таймаут остановки listener container'а); не полагайся на то, что `server.shutdown=graceful` остановит и их — эта настройка относится только к встроенному веб-серверу.
+- Не вводи файловое состояние/локальный кэш, критичный для консистентности между запросами одного клиента — сервис должен одинаково обрабатывать запрос независимо от того, какая реплика его приняла.
+- Настраивай JVM-флаги контейнера (`-XX:MaxRAMPercentage=75.0`) согласованно с `resources.limits.memory` манифеста, если манифесты есть в зоне ответственности репозитория; если манифестов в репозитории нет — не выдумывай их, ограничься приложенческой частью (properties/код).
+- Startup probe — добавляй для сервисов с медленной инициализацией (прогрев кэшей, миграции при старте), чтобы liveness не убивал под во время старта.
 
----
-
-<!-- source: auto -->
 ## 3. Чек-лист
 
-- [ ] `management.endpoint.health.probes.enabled=true` выставлено в `application.properties`
-- [ ] `management.endpoints.web.exposure.include` содержит `startup` вместе с `health` (оба)
-- [ ] Точка входа использует `BufferingApplicationStartup` (`WebApplication.java`)
-- [ ] Все изменения с пробами вносить только в `application.properties`/коде, без выдумывания K8s-манифестов (их в репо нет)
-- [ ] Метрики для новых бизнес-процессов добавляются через `MeterRegistry`/`MeterFilter` (конфиг `OpenTelemetryConfig`)
-- [ ] Для критических внешних зависимостей — добавлен `HealthIndicator` (рекомендация; сейчас отсутствуют)
-- [ ] При изменении endpoint exposure не забыть включить и `startup`, и `health` (требование `rules/10`)
-- [ ] В коде/pr не появляется значений секретов (нет реальных паролей/ключей в примерах и комментариях)
+- [ ] `liveness` и `readiness` — раздельные проверки/группы
+- [ ] `server.shutdown=graceful` настроен, таймаут разумен для средней длительности запроса и задержки распространения readiness
+- [ ] Фоновые исполнители/шедулеры (`ThreadPoolTaskExecutor`, Kafka listener containers, `@Scheduled`) донастроены на завершение in-flight работы при остановке, а не только встроенный веб-сервер
+- [ ] Сервис не хранит критичное состояние в памяти инстанса между запросами
+- [ ] Конфигурация — через переменные окружения, не через файлы, специфичные для хоста
+- [ ] JVM heap рассчитан относительно memory limit контейнера, не как абсолютная константа "на глаз"
+- [ ] Логи пишутся в stdout/stderr
+- [ ] Startup probe добавлен, если инициализация сервиса медленная
 
----
+## 4. Примеры кода
 
-<!-- source: auto -->
-## 4. Примеры из кода
-
-### Example 1: Probes/actuator в `application.properties`
-**Путь:** `objects/src/main/resources/application.properties`
-
-```
+```properties
 management.endpoint.health.probes.enabled=true
-management.endpoint.startup.enabled=true
-management.endpoints.web.exposure.include=startup,health,info,metrics,env
+management.endpoint.health.group.liveness.include=livenessState
+management.endpoint.health.group.readiness.include=readinessState,db,externalApi
+server.shutdown=graceful
+spring.lifecycle.timeout-per-shutdown-phase=25s
 ```
 
-### Example 2: Startup через `BufferingApplicationStartup`
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/WebApplication.java`
-
-```java
-@SpringBootApplication
-public class WebApplication {
-    public static void main(String... args) {
-        new SpringApplicationBuilder(WebApplication.class)
-                .applicationStartup(new BufferingApplicationStartup(WebApplicationConstants.APPLICATION_STARTUP_BUFFER_CAPACITY))
-                .run(args);
-    }
-}
+```dockerfile
+# heap — доля от лимита контейнера, не абсолютное значение
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]
 ```
-
-### Example 3: OTel MeterFilter для метрик
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/OpenTelemetryConfig.java`
 
 ```java
 @Bean
-public MeterFilter nameConfigFilter() { ... id.withName(ci + "." + name).withTags(Tags.of("app", appName, "pod", POD_NAME, "stand", STAND)); }
+public ThreadPoolTaskExecutor orderEventExecutor() {
+    var executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(4);
+    executor.setWaitForTasksToCompleteOnShutdown(true); // не обрывает задачу на SIGTERM
+    executor.setAwaitTerminationSeconds(20);             // в согласии с окном graceful shutdown веб-сервера
+    return executor;
+}
 ```
 
----
+## 5. Когда пересматривать
 
-<!-- source: auto -->
-## 5. Исключения и оговорки
-
-- Соглашение ограничивается **конфигурацией приложения** (Spring properties + код). Платформенные K8s/Helm-манифесты не находятся в этом репозитории, поэтому вопросы деплоя и поды — зона `rules/`/платформы, не локального файла.
-- Кастомные `HealthIndicator` — **рекомендация**, а не текущий факт репо (их сейчас нет); при добавлении не нарушать агрегирующий `status` по умолчанию.
-- `server.shutdown=graceful` на текущий момент не настроен — добавлять при явной необходимости.
-
----
-
-## 6. Обновление
-
-Файл обновлять при: изменении `spring-boot-starter-actuator` / версии OpenTelemetry в `objects/pom.xml`, изменении probe/OTLP-настроек в `application.properties`, либо появлении в репозитории Dockerfile/kubernetes-манифестов.
+При смене оркестратора/платформы деплоя, изменении контрактов probes, при добавлении первого фонового исполнителя/шедулера с жизненным циклом, не совпадающим с HTTP-сервером, или инцидентах с обрывом запросов/задач при деплое/масштабировании.

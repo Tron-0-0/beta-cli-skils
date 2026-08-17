@@ -23,12 +23,11 @@ Production-код **не меняется** — этот скилл модифи
 
 **Краткая выжимка по конвенциям проекта (fallback):**
 - **Тест-фреймворк:** JUnit 5 + Mockito 5 + AssertJ
-- **Паттерн:** чистые unit-тесты без Spring-контекста (`@ExtendWith(MockitoExtension.class)`)
-- **Нет:** `@SpringBootTest`, `@WebMvcTest`, `@DataJpaTest`, Testcontainers
+- **Пирамида тестов:** unit-тесты сервисов/мапперов — без Spring-контекста (`@ExtendWith(MockitoExtension.class)`); slice-тесты (`@WebMvcTest` для контроллеров, `@DataJpaTest` + Testcontainers для репозиториев) — когда стоит проверить реальное поведение слоя, а не только вызовы моков; `@SpringBootTest` — только для критичных сквозных сценариев (этот скилл их не генерирует, см. «Строгие ограничения» ниже про область изменений)
 - **DI в тестах:** `@Mock`/`@Spy` + `@InjectMocks` через `@RequiredArgsConstructor`
 - **Размещение:** `<модуль>/src/test/java/<пакет>` — зеркально `src/main/java` (модуль и пакет — по факту структуры проекта)
 - **Именование тест-класса:** `*ServiceImplTest`, `*MapperTest`, `*ControllerTest`
-- **Именование метода:** `<Method>_<condition>_<expectedResult>` (пример: `createObject_withUnknownProcessType_shouldThrowIllegalArgument`)
+- **Именование метода:** `<Method>_<condition>_<expectedResult>` (пример: `createOrder_withUnknownStatus_shouldThrowIllegalArgument`)
 - **DisplayName:** русский, на тест-классе и методе
 - Перед генерацией новых тестов посмотри на существующие тест-классы в `src/test/java` — они задают
   фактический стиль проекта; выжимка выше — только fallback, если service-rules недоступны
@@ -128,7 +127,7 @@ Production-код **не меняется** — этот скилл модифи
    |-------------------------------|-----------------------|
    | `*ServiceImpl.java`, `*Mapper.java`, `*Controller.java` | `01_coding.md` (DI, MapStruct, слои, форматирование вызовов) |
    | `NUMERIC`, `BigDecimal`, `денежное` | `13_monetary.md` (денежные поля — только `BigDecimal`) |
-   | `enum`, `ObjectStatus`, `ObjectTypeName` | `17_enums_over_constants.md` (предпочтение enum) |
+   | `enum`, статус, перечисление, код | `01_coding.md` (§1.7 enum vs константы) |
 
 4. Прочитай **ТОЛЬКО релевантные** rules через `read_file → .gigacode/service-rules/{filename}.md`.
 5. Зафиксируй список загруженных rules в контексте сессии — они применяются при генерации тестов на Шаге 2.
@@ -228,13 +227,14 @@ Production-код **не меняется** — этот скилл модифи
        }
    }
    ```
-   Пример из проекта — `ObjectControllerTest` с `@Mock ObjectCreationService`, `@Mock ObjectReadService`,
-   `@InjectMocks ObjectController`.
+   Пример — `OrderControllerTest` с `@Mock OrderService`, `@InjectMocks OrderController`.
 2. Если у endpoint-метода есть параметры с `@RequestHeader` (например `X-Request-Id`,
-   `X-Correlation-Id`, `X-SberPDI`) — передавай значения заголовков как обычные аргументы метода
+   `Idempotency-Key`) — передавай значения заголовков как обычные аргументы метода
    в `@Test` и проверяй их использование через `verify(...)`. Тест вызывает Java-метод контроллера
    напрямую (без MockMvc/Spring-контекста), поэтому реальный HTTP-запрос и его заголовки не
-   участвуют — есть только параметры метода.
+   участвуют — есть только параметры метода. Если нужно проверить поведение на уровне HTTP/
+   сериализации (не только вызов метода) — используй `@WebMvcTest` (slice) вместо чистого
+   Mockito-теста, см. `06_unit_tests_with_spring_context.md`.
 
 ### 2.3 MapStruct-мапперы (`*MapperTest`)
 
@@ -251,18 +251,18 @@ Production-код **не меняется** — этот скилл модифи
    }
    ```
 
-### 2.4 Пример из проекта
+### 2.4 Пример негативного теста
 
-**Пример негативного теста** (`ObjectCreationServiceImplTest`):
+**Пример** (`OrderServiceImplTest`):
 ```java
 @Test
-@DisplayName("createObject — неизвестный код процесса — IllegalArgumentException")
-void createObject_withUnknownProcessType_shouldThrowIllegalArgument() {
-   assertThatThrownBy(() -> service.createObject(request))
+@DisplayName("createOrder — неизвестный статус — IllegalArgumentException")
+void createOrder_withUnknownStatus_shouldThrowIllegalArgument() {
+   assertThatThrownBy(() -> service.createOrder(request))
            .isInstanceOf(IllegalArgumentException.class)
-           .hasMessageContaining("999");
-   verify(serviceService).checkExistObjectsForContractVersionId(CONTRACT_VERSION_ID);
-   verifyNoInteractions(rentalObjectService, assetObjectService);
+           .hasMessageContaining("UNKNOWN");
+   verify(orderRepository).existsByExternalId(EXTERNAL_ID);
+   verifyNoInteractions(paymentService);
 }
 ```
 
@@ -378,7 +378,7 @@ void createObject_withUnknownProcessType_shouldThrowIllegalArgument() {
 
 | Тест-класс | Тест-метод | Причина обновления |
 |-----------|------------|--------------------|
-| `ObjectCreationServiceImplTest.java` | `createObject_withUnknownProcessType_shouldThrowIllegalArgument()` | изменилась сигнатура метода |
+| `OrderServiceImplTest.java` | `createOrder_withUnknownStatus_shouldThrowIllegalArgument()` | изменилась сигнатура метода |
 | ... | ... | ... |
 
 ## Итог
@@ -404,7 +404,7 @@ void createObject_withUnknownProcessType_shouldThrowIllegalArgument() {
 - **Обязательный Шаг 0.6:** всегда загружай service-rules на Шаге 0.6 (после gate-check) перед анализом инкремента.
 - **Область модифицируемых файлов** — см. «Строгие ограничения» в начале скилла: только тесты
   и test-report.md.
-- **Не используй `@SpringBootTest`, `@WebMvcTest`, `@DataJpaTest`** — только чистые unit-тесты на Mockito.
+- **По умолчанию — чистые unit-тесты на Mockito** для сервисов/мапперов, без Spring-контекста. Slice-тесты (`@WebMvcTest`/`@DataJpaTest` + Testcontainers) — только когда стоит проверить реальное поведение слоя (HTTP-сериализация, JPQL-запрос), см. `06_unit_tests_with_spring_context.md`; `@SpringBootTest` этот скилл не генерирует — он вне области unit-тестирования по инкременту.
 - **Не меняй существующие тесты без необходимости** — обновляй только при изменении сигнатур/логики.
 - Пропуск шагов запрещён, кроме `--skip-gate-checks` (только для отладки, и его использование обязательно
   отражается в test-report.md и в сообщении пользователю).

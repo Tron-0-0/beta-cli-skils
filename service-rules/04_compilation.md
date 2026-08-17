@@ -3,143 +3,98 @@ apply: always
 mode: all
 ---
 
-<!-- source: auto -->
-# Соглашение: Сборка и компиляция (profitcontr-objects)
+# Соглашение: Сборка и статический анализ
 
-**Когда читать:** При проблемах сборки, настройке CI, или добавлении зависимостей.
+**Когда читать:** при проблемах сборки, настройке CI, добавлении зависимостей.
 
-**Что описывает:** Maven-команды, профили сборки, CI/CD конфигурация, JVM-аргументы.
-
-**Глобальный эталон:** `rules/04_compilation.md`
+**Что описывает:** команды сборки, статический анализ, проверку зависимостей на уязвимости, покрытие тестами, CI-конвейер.
 
 ---
 
-<!-- source: auto -->
-## 1. Наблюдения в репозитории
+## 1. Правило
 
-### 1.1 Multi-module reactor: корень pom — агрегатор, два модуля
+- **Единая команда локальной сборки**, эквивалентная CI: `./mvnw clean verify` (Maven) или `./gradlew check` (Gradle) — прогоняет компиляцию, статический анализ, тесты. Команда запускается через закоммиченный в репозиторий wrapper (`mvnw`/`gradlew`), а не через локально установленный Maven/Gradle — иначе версия инструмента у разработчика и в CI может разойтись, и «зелёная локально» сборка не гарантирует «зелёную» в CI. Мерж без зелёной сборки — недопустим.
+- **Статический анализ** — минимум связка Checkstyle (стиль) + PMD или SpotBugs (баги/анти-паттерны); настройки — в конфиг-файлах репозитория, а не по умолчанию инструмента. Нарушения ломают сборку (`failOnViolation=true`/`failOnError=true`), а не просто логируются. Лимиты длины/сложности из `16_refactoring.md` (метод ≤30 строк, цикломатическая сложность ≤5, вложенность ≤3, параметров ≤5) — не только договорённость на ревью, а конкретные правила PMD (`ExcessiveMethodLength`, `CyclomaticComplexity`, `ExcessiveParameterList`) в конфиге статического анализа, ломающие сборку при нарушении.
+- **Проверка зависимостей на уязвимости** — отдельный шаг сборки (OWASP Dependency-Check или аналог), сверяющий транзитивные зависимости с базой CVE; порог (например, CVSS ≥ 7) ломает сборку. Отдельный от Checkstyle/PMD/SpotBugs шаг — те проверяют качество своего кода, этот проверяет уязвимости в чужом.
+- **Покрытие тестами** — JaCoCo, привязан к фазе `test`; порог покрытия (если задан) — по изменённым строкам (diff coverage) предпочтительнее общего порога по всему проекту — иначе легаси-код с низким покрытием блокирует любой PR. JaCoCo сам по себе diff coverage не считает — только общий/по-файловый отчёт; расчёт по изменённым строкам нужен через отдельный механизм: Quality Gate на New Code в SonarQube (если используется) или внешний скрипт (например, `diff-cover`), парсящий `jacoco.xml` вместе с `git diff`.
+- **Версии зависимостей** — управляются BOM/родителем там, где возможно; версия задаётся в `<dependency>` только если её нет в BOM.
+- **Мутационное тестирование** (Pitest) — опциональный тяжёлый профиль, отдельная команда, не часть обычного `verify` (иначе сборка становится слишком медленной для повседневной разработки).
+- **CI-конвейер** воспроизводит те же команды, что разработчик гоняет локально — не должно быть шагов, существующих только в CI и непроверяемых локально.
 
-Корень `pom.xml` — агрегатор (`<packaging>pom</packaging>`, `groupId=ru.sbrf.sbererp.profitcontr`, `artifactId=profitcontr`, `version=1.0.2-SNAPSHOT`) с модулями `objects` и `objects-rest-client`. Родитель — `sbererp-bom:2026.05.0` (`ru.sbrf.sbererp.common`), который управляет версиями Spring Boot / Spring Cloud / прочих стартеров; в корневом `<properties>` заданы только собственные версии (`pitest-maven.version=1.17.1`, `spotbugs-maven-plugin.version=4.7.3.6`, `micrometer-registry-otlp.version=1.16.6`, `spring-boot-starter-opentelemetry.version=4.0.6`, `sbererp-starter-logging.version=1.23.0-sb4.441` и др.).
-
-`objects/pom.xml` задаёт `<java.version>21</java.version>` и содержит `spring-boot-maven-plugin` (исполнение `repackage` собирает исполняемый jar приложения). `objects-rest-client/pom.xml` — библиотека: тот же плагин отключён для repackage через `<spring-boot.repackage.skip>true</spring-boot.repackage.skip>`.
-
-### 1.2 Фазы статического анализа из корневого pom (в `mvn verify` / `mvn test`)
-
-В `<build><plugins>` корневого `pom.xml` настроены проверки, привязанные к фазам Maven:
-
-| Плагин | Правила | Фаза / привязка | Локальные настройки |
-|---|---|---|---|
-| `maven-checkstyle-plugin` | `checkstyle.xml` | `validate` (goal `check`) | `failsOnError=true`, `consoleOutput=true`, `excludeGeneratedSources=true` (MapStruct) |
-| `maven-pmd-plugin` | `pmd.xml` | default (goal `check`) | `failOnViolation=true`, `printFailingErrors=true`, `targetJdk=${java.version}` |
-| `spotbugs-maven-plugin` | `spotbugs.xml` | default (goal `check`) | `excludeFilterFile=spotbugs.xml`, `failOnError=true` |
-
-Только в модуле `objects` подключён `spring-boot-maven-plugin` (без версии — берёт из BOM). JaCoCo настроен в корневом `pom.xml` (`jacoco-maven-plugin`, `prepare-agent` + `report` в фазе `test`) и включён как поставщик покрытия SonarQube (`sonar.java.coveragePlugin=jacoco`, `sonar.projectKey=CI06228014:CI15418320`).
-
-### 1.3 Профиль `mutation-testing` (Pitest) в корневом pom
-
-Одноактивируемый профиль `mutation-testing` (активация по свойству `<mutationTesting>`) подключает `pitest-maven` с `pitest-junit5-plugin` (goal `mutationCoverage` в фазе `verify`), формат отчёта `HTML` + `XML`, мутаторы `DEFAULTS`. Исключены классы `ru.sbrf.sbererp.profitcontr.objects.configuration.*` и `WebApplication`. Запуск — `mvn verify -Pmutation-testing`.
-
-### 1.4 Локальный запуск и переменные окружения
-
-README (`README.md`) пуст — команд в нём нет (источник фраз не подтверждён в репо). Переменные окружения для запуска/компиляции документально зафиксированы в дереве проекта (см. `objects/src/main/resources/application.properties` и `accounting.env`): `DB_HOST/DB_PORT/DB_NAME/DB_USERNAME/DB_PASSWORD/DB_DRIVER/DB_PARAM/DB_SCHEMA`, `OPENTELEMETRY_EXPORT_URL`, опциональные `APPLICATION_PORT=8080`, `LIQUIBASE_ENABLED=false`, `SWAGGER_UI_ENABLED=false`, `API_DOCS_ENABLED=false`.
-
-### 1.5 CI/CD — НЕ ОПРЕДЕЛЕНО
-
-В репозитории нет `Jenkinsfile`, `.github/workflows/*.yml` или каталога `ci/` (scan `stack.global_rules` фиксирует только `core-gigacode-skills`, CI-файлы не найдены). Конвейеры сборки/деплоя не подтверждены — не придумывать CI-практики и не ссылаться на несуществующие `Jenkinsfile`. (SonarQube-скан задан в `pom.xml`: `sonar.host.url=https://sonar.delta.sbrf.ru/sonar`.)
-
-<!-- source: auto -->
 ## 2. Соглашения для агента
 
-1. После правок в `objects/` или `objects-rest-client/` собирай весь reactor командой `mvn clean verify` из корня (`C:\Work\profitcontr-objects\pom.xml`) — по умолчанию она прогоняет checkstyle (фаза `validate`), PMD и SpotBugs, компиляцию, все тесты и JaCoCo `/test` coverage; commit/merge без зелёного `verify` не делай.
-2. До commit'а исправляй замечания трёх статических анализаторов из корневого `pom.xml` — локализуй правила в `checkstyle.xml`, `pmd.xml`, `spotbugs.xml` и прогоняй фазы: checkstyle в `validate`, PMD и SpotBugs при сборке; при точечной проверке — `mvn checkstyle:check pmd:check spotbugs:check`.
-3. Версии зависимостей держи в корневых `<properties>` корневого `pom.xml` (например `<pitest-maven.version>`), а версии Spring/Spring Cloud — не хардкодь: они берутся из `sbererp-bom:2026.05.0`. Новую зависимость в `objects/pom.xml` добавляй без `<version>`, если версией управляет BOM.
-4. Мутационное тестирование выполняй отдельным профилем `mvn verify -Pmutation-testing` (активация по свойству `mutationTesting`); не гоняй его в обычном `mvn verify`.
-5. Исполняемый артефакт собирает только модуль `objects` (`spring-boot-maven-plugin`); `objects-rest-client` — библиотека: проверяй, что у неё остаётся `<spring-boot.repackage.skip>true</spring-boot.repackage.skip>` и она не переупаковывается в boot-jar. SDK при сборке — Java 21 (`<java.version>21</java.version>`).
+1. После правок собирай проект локальной командой через wrapper (`./mvnw`/`./gradlew`), эквивалентной CI, прежде чем предлагать изменение как готовое.
+2. Исправляй замечания статического анализа до коммита, а не подавляй их аннотациями `@SuppressWarnings`/`NOPMD` без причины в комментарии; превышение лимитов длины/сложности из `16_refactoring.md` — рефактори метод/класс, а не поднимай порог в конфиге анализатора.
+3. Новую зависимость добавляй без явной версии, если ей управляет родительский BOM; если версии в BOM нет — версию выносить в `<properties>`.
+4. Новую зависимость с известной уязвимостью (по отчёту dependency-check) не добавляй без явного согласования — ищи версию без известного CVE или обоснуй исключение (suppression) со ссылкой на причину.
+5. Не запускай мутационное тестирование в обычном цикле проверки — это отдельный, осознанно вызываемый шаг.
+6. Генерируемый код (MapStruct, Lombok) исключай из проверки статического анализа и покрытия — не тратить бюджет ревью на сгенерированные файлы.
 
-<!-- source: auto -->
 ## 3. Чек-лист
 
-- [ ] Проект собирается командой `mvn clean verify` из корня без ошибок (checkstyle `validate` + PMD + SpotBugs + тесты)
-- [ ] Тесты и JaCoCo-отчёт проходят при стандартной итерации — `mvn test` (JaCoCo `report` привязан к фазе `test`)
-- [ ] Замечания `checkstyle.xml` (фаза `validate`, star-imports, Javadoc типов, trailing comments) устранены
-- [ ] Замечания PMD (`pmd.xml`, `failOnViolation=true`) и SpotBugs (`spotbugs.xml`, `failOnError=true`) устранены
-- [ ] Новая зависимость имеет version в корневых `<properties>` только если её нет в `sbererp-bom:2026.05.0`; иначе `<version>` не указывается
-- [ ] Мутационное покрытие проверено при необходимости командой `mvn verify -Pmutation-testing` (профиль `mutation-testing`)
-- [ ] `objects-rest-client` остаётся библиотекой: `<spring-boot.repackage.skip>true</spring-boot.repackage.skip>` на месте, repackage выполняется только для `objects`
-- [ ] SDКА при сборке — Java 21 (`<java.version>21</java.version>`, `targetJdk=${java.version}` для PMD)
-- [ ] Переменные окружения БД/OTLP корректны (см. `accounting.env`, `application.properties`): `DB_SCHEMA=${DB_SCHEMA}`, `OPENTELEMETRY_EXPORT_URL` и др.
-- [ ] CI-конфигурация (`Jenkinsfile`) актуальна — в репо её нет, любые заявления о CI помечать как `НЕ ОПРЕДЕЛЕНО` до появления файла
-- [ ] Профиль `mutation-testing` из `pom.xml` задокументирован (активация по свойству `mutationTesting`)
+- [ ] Проект собирается локальной командой через wrapper (`./mvnw`/`./gradlew`), эквивалентной CI, без ошибок
+- [ ] Статический анализ проходит без подавленных без причины предупреждений
+- [ ] Лимиты длины/сложности (`16_refactoring.md`) включены в конфиг статического анализа, а не только на словах
+- [ ] Проверка зависимостей на уязвимости (dependency-check или аналог) проходит без новых CVE выше порога
+- [ ] Тесты и отчёт покрытия проходят
+- [ ] Новая зависимость не дублирует версию, управляемую BOM
+- [ ] CI выполняет ровно то же, что можно запустить локально
+- [ ] Мутационное тестирование (если используется) — в отдельном профиле, не в стандартном `verify`
 
-<!-- source: auto -->
-## 4. Примеры из кода
-
-### Example 1: ObjectsClientAutoConfiguration.java
-**Путь:** `objects-rest-client/src/main/java/ru/sbrf/sbererp/profitcontr/objects/client/configuration/ObjectsClientAutoConfiguration.java`
-
-```java
-package ru.sbrf.sbererp.profitcontr.objects.client.configuration;
-
-import org.springframework.boot.autoconfigure.AutoConfiguration;
-import org.springframework.cloud.openfeign.EnableFeignClients;
-import ru.sbrf.sbererp.profitcontr.objects.client.ObjectsClient;
-
-/**
- * Автоконфигурация для стартера клиента.
- */
-@AutoConfiguration
-@EnableFeignClients(
-        basePackageClasses = ObjectsClient.class
-)
-public class ObjectsClientAutoConfiguration {
-}
-```
-
-### Example 2: spring-boot-maven-plugin в objects/pom.xml
-**Путь:** `objects/pom.xml`
+## 4. Пример конфигурации (Maven)
 
 ```xml
-<build>
-    <plugins>
-        <plugin>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-maven-plugin</artifactId>
-        </plugin>
-    </plugins>
-</build>
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-checkstyle-plugin</artifactId>
+    <configuration>
+        <configLocation>checkstyle.xml</configLocation>
+        <failsOnError>true</failsOnError>
+        <excludeGeneratedSources>true</excludeGeneratedSources>
+    </configuration>
+    <executions>
+        <execution><phase>validate</phase><goals><goal>check</goal></goals></execution>
+    </executions>
+</plugin>
+<plugin>
+    <groupId>org.jacoco</groupId>
+    <artifactId>jacoco-maven-plugin</artifactId>
+    <executions>
+        <execution><goals><goal>prepare-agent</goal></goals></execution>
+        <execution><id>report</id><phase>test</phase><goals><goal>report</goal></goals></execution>
+    </executions>
+</plugin>
+<plugin>
+    <!-- pmd.xml включает ExcessiveMethodLength (30), CyclomaticComplexity (5),
+         ExcessiveParameterList (5) — те же лимиты, что в 16_refactoring.md -->
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-pmd-plugin</artifactId>
+    <configuration>
+        <rulesets><ruleset>pmd.xml</ruleset></rulesets>
+        <failOnViolation>true</failOnViolation>
+    </configuration>
+    <executions>
+        <execution><phase>verify</phase><goals><goal>check</goal></goals></execution>
+    </executions>
+</plugin>
+<plugin>
+    <groupId>org.owasp</groupId>
+    <artifactId>dependency-check-maven</artifactId>
+    <configuration>
+        <failBuildOnCVSS>7</failBuildOnCVSS>
+    </configuration>
+    <executions>
+        <execution><phase>verify</phase><goals><goal>check</goal></goals></execution>
+    </executions>
+</plugin>
 ```
 
-`objects-rest-client/pom.xml` отключает переупаковку: `<spring-boot.repackage.skip>true</spring-boot.repackage.skip>`.
+Мутационное тестирование — отдельным профилем:
 
-### Example 3: Профиль mutation-testing в корневом pom.xml
-**Путь:** `pom.xml`
-
-```xml
-<profile>
-    <id>mutation-testing</id>
-    <activation>
-        <property><name>mutationTesting</name></property>
-    </activation>
-    ...
-    <plugin>
-        <groupId>org.pitest</groupId>
-        <artifactId>pitest-maven</artifactId>
-        <version>${pitest-maven.version}</version>
-        ...
-    </plugin>
-</profile>
+```bash
+./mvnw verify -Pmutation-testing
 ```
 
----
+## 5. Когда пересматривать
 
-<!-- source: auto -->
-## 5. Исключения и оговорки
-
-- Расписание/пайплайны CI в репозитории отсутствуют (нет `Jenkinsfile`, `.github/workflows`, `ci/`) — тема CI/Pipeline остаётся `НЕ ОПРЕДЕЛЕНО`: любые упоминания Jenkins-джоб или сборок в CI должны быть удалены из текста соглашения, пока файлы не появятся.
-- `README.md` пуст — команды сборки в эталоне/гайде не имеют локальной привязки в README; фактически они подтверждены конфигурацией корневого `pom.xml` и `objects/pom.xml`.
-- Конвенция «версии остальных библиотек в `<properties>`» относится к корневому `pom.xml`; в модуль-библиотеке `objects-rest-client` свои версии наследуются из корня/BOM.
-
-<!-- source: auto -->
-## 6. Обновление
-
-Пересобирать при смене версии Java (сейчас 21), добавлении/изменении профилей сборки в корневом `pom.xml`, изменении BOM-версии `sbererp-bom`, а также при появлении в репозитории реальных CI-файлов (`Jenkinsfile`, `.github/workflows`), которые снимут статус `НЕ ОПРЕДЕЛЕНО` у §1.5.
+При смене версии Java, изменении набора статических анализаторов, введении/изменении порога покрытия или CVSS-порога сканирования зависимостей, либо появлении нового CI-провайдера.

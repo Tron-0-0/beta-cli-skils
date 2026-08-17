@@ -132,7 +132,7 @@ author: Альберт Гафаров
    | «маппер», «MapStruct», «DTO», «преобразование» | `01_coding.md` |
    | «сервис», «бизнес-логика», «валидация», `@Service` | `01_coding.md`, `16_refactoring.md` |
    | «денежное поле», «сумма», «стоимость», «BigDecimal», «руб» | `13_monetary.md` |
-   | «enum», «статус», «перечисление», «код» | `17_enums_over_constants.md` |
+   | «enum», «статус», «перечисление», «код» | `01_coding.md` (§1.7 enum vs константы) |
    | «тест», «unit», `Mockito`, `AssertJ` | `06_unit_tests_with_spring_context.md` |
    | «логирование», «MDC», `@Slf4j`, `log.error` | `09_logging.md` |
    | «метрик», «health», «probe», `actuator` | `02_monitors.md` |
@@ -242,14 +242,13 @@ author: Альберт Гафаров
 
 | Загруженный rule | Применяется к разделу | Какие конвенции |
 |------------------|----------------------|-----------------|
-| `01_coding.md` | Изменения в коде (общее) | DI через `@RequiredArgsConstructor`, MapStruct со `StrictMapperConfiguration`, форматы вызовов: ≤3 params → одна строка, 4 params → каждый с новой строки, ≥5 params → record |
-| `03_migrations.md` | Изменения в коде (БД-миграция) | Версионирование `v{major.minor.patch}`, корневой `0001_changelog.xml` → `changelog.xml` → папки таблиц; formatted SQL + `--changeset id:` + `COMMENT ON` + `--rollback` |
-| `08_database.md` | Изменения в коде (Entity, Repository) | UUID PK `@GeneratedValue(UUID)`, `@Table(name=snake_case)`, JPA-согласованность с Liquibase 1:1, аудит `@CreatedDate`/`@Version` **отсутствует** |
-| `13_monetary.md` | Изменения в коде (DTO, Entity) | Денежные поля — `BigDecimal`, `double`/`float` запрещены; `NUMERIC(precision, scale)` в DDL |
-| `17_enums_over_constants.md` | Изменения в коде (Enums) | Типы, статусы, коды — только `enum` в `model/enums/`; константы — только для конфигурации |
-| `07_api_contract.md` | Изменения в коде (Controller) | Base path из констант `WebApplicationConstants.*`, обязательные заголовки `request-id`/`correlation-id`/`sberpdi` |
-| `06_unit_tests_with_spring_context.md` | Тесты | Чистые unit-тесты на Mockito/AssertJ; **нет** `@SpringBootTest`/`@WebMvcTest`/`@DataJpaTest` |
-| `16_refactoring.md` | Изменения в коде (Сервис) | Методы ≤30 строк, классы ≤200 строк, сложность ≤5; template-паттерн для дублирующихся сервисов |
+| `01_coding.md` | Изменения в коде (общее) | DI через `@RequiredArgsConstructor`, MapStruct-мапперы с `uses = {...}` для вложенных объектов, `enum` вместо констант для типов/статусов (§1.7), форматы вызовов: ≤3 params → одна строка, 4 params → каждый с новой строки, ≥5 params → параметр-объект (record) |
+| `03_migrations.md` | Изменения в коде (БД-миграция) | Liquibase/Flyway (один инструмент на проект); версионирование по релизу или монотонной дате; immutable применённые changeset'ы; `COMMENT ON` на новую таблицу/колонку + `--rollback`; breaking-изменения — через expand/contract |
+| `08_database.md` | Изменения в коде (Entity, Repository) | `@Table(name=snake_case)`, суррогатный PK (`UUID`/`BIGINT` + `@GeneratedValue`), имена совпадают с миграцией 1:1; связи `LAZY` по умолчанию; списки — `Page`/`Slice`, не `List`; `@Version` на конкурентно изменяемых сущностях; аудит через `@CreatedDate`/`@LastModifiedDate` |
+| `13_monetary.md` | Изменения в коде (DTO, Entity) | Денежные поля — `BigDecimal`, `double`/`float` запрещены; `NUMERIC(precision, scale)` в DDL; округление — явный `RoundingMode` |
+| `07_api_contract.md` | Изменения в коде (Controller) | URL — kebab-case существительные во множественном числе; HTTP-статусы по семантике; единый формат ошибок (RFC 7807 или аналог); обязательные корреляционные заголовки (`X-Request-Id`/`traceparent`); `Idempotency-Key` на мутирующих эндпоинтах |
+| `06_unit_tests_with_spring_context.md` | Тесты | Пирамида тестов: unit на Mockito/AssertJ без Spring-контекста (сервисы, мапперы), slice-тесты (`@WebMvcTest`/`@DataJpaTest` + Testcontainers), `@SpringBootTest` — только для критичных сквозных сценариев |
+| `16_refactoring.md` | Изменения в коде (Сервис) | Методы ≤30 строк, классы ≤200 строк, цикломатическая сложность ≤5; правило трёх — абстракция только после третьего повторения |
 
 Если rules не загружались — см. фолбэк в конце Шага 0.6 (те же условия и то же поведение).
 

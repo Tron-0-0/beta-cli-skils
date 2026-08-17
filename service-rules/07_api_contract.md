@@ -3,191 +3,125 @@ apply: always
 mode: all
 ---
 
-<!-- source: auto -->
-# Соглашение: API и контракты (REST, OpenAPI) (profitcontr-objects)
+# Соглашение: API и контракты (REST, OpenAPI)
 
-**Когда читать:** При создании/изменении REST API, обновлении контрактов, или настройке OpenAPI.
+**Когда читать:** при создании/изменении REST API, обновлении контрактов, настройке OpenAPI.
 
-**Что описывает:** Контроллеры, DTO-валидация, обязательные заголовки, OpenAPI/Swagger, формат ошибок.
-
-**Глобальный эталон:** `rules/07_api_contract.md`
+**Что описывает:** контроллеры, DTO-валидацию, обязательные заголовки, формат ошибок, версионирование.
 
 ---
 
-<!-- source: auto -->
-## 1. Наблюдения в репозитории
+## 1. Правило
 
-### 1.1 Контроллер и base path
+- **URL** — существительные во множественном числе, kebab-case (`/orders/{order-id}`), без глаголов (`/orders/cancel` — плохо, `PATCH /orders/{id}` со статусом в теле — лучше).
+- **Один контроллер — один ресурс.** `OrderController` отвечает только за `/orders`, не за несколько не связанных друг с другом сущностей в одном классе («god-контроллер»). Методы контроллера называются по действию (`getById`, `create`, `update`, `delete`, `list`), а не по HTTP-глаголу (`post`/`get`).
+- **HTTP-статусы** — по семантике: `200` (успех с телом), `201` + `Location` (создание), `204` (успех без тела), `400` (невалидный запрос), `401` (не аутентифицирован), `403` (аутентифицирован, но нет прав), `404` (не найдено), `409` (конфликт/дубликат), `422` (валидна структура, но невалидны данные по бизнес-правилам), `5xx` — только для реальных ошибок сервера, не для ожидаемых бизнес-исключений.
+- **Формат ошибок** — единый на весь API, предпочтительно RFC 7807 `application/problem+json` (`type`, `title`, `status`, `detail`, `instance`) или эквивалентный собственный формат, но **один**, не разный для каждого контроллера.
+- **Непредвиденные ошибки не раскрывают внутреннюю реализацию** — недоменное исключение (NPE, ошибка SQL-драйвера, стектрейс и т.п.) не попадает в тело ответа клиенту; наружу — общий `500` с нейтральным сообщением, детали — только в лог (см. `09_logging.md`). Доменные исключения с заранее осмысленным сообщением (`OrderAlreadyExistsException` и т.п.) — не в счёт, их текст безопасен для клиента по построению.
+- **Валидация входа** — Bean Validation (`@Valid` + `jakarta.validation` аннотации на DTO), а не ручные `if`-проверки в контроллере/сервисе для структурных ограничений (обязательность, формат, диапазон).
+- **Версионирование** — либо в URL (`/api/v1/...`), либо в заголовке (`Accept-Version`); выбранный способ — единый для всего API. Breaking changes (удаление/переименование поля, смена типа, изменение семантики статуса) не вносятся в существующую версию — новая версия эндпоинта или явный deprecation-период. Добавление нового необязательного поля в ответ или запрос — не breaking change и новой версии не требует.
+- **Корреляция запросов** — сквозные заголовки (`X-Request-Id`/`traceparent`) принимаются и пробрасываются дальше по цепочке вызовов и в логи (см. `09_logging.md`).
+- **Идемпотентность мутаций** — `POST`/`PATCH` с побочным эффектом, для которых клиент может повторить запрос при таймауте/обрыве связи, принимают `Idempotency-Key` (см. `14_idempotency_rest.md`); это часть контракта эндпоинта, а не факультативная доработка.
+- **Толерантная десериализация входящих DTO** (`@JsonIgnoreProperties(ignoreUnknown = true)`) — чтобы добавление нового поля в клиенте не ломало старый сервер.
+- **Пагинация** списковых эндпоинтов — курсор или offset/limit с явными параметрами (`page`, `size`) и метаданными в ответе (`totalElements`/`hasNext`), не выгрузка всего списка без ограничения.
 
-Единственный REST-контроллер — `ObjectController`
-(`objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/controller/ObjectController.java`).
-Base path задаётся `@RequestMapping(DEFAULT_URL_PREFIX_API + OBJECTS_URL_PREFIX_APU)`.
-
-Константы (в `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/constants/WebApplicationConstants.java`):
-- `DEFAULT_URL_PREFIX_API = "/api/v1/profitcontr/objects"`
-- `OBJECTS_URL_PREFIX_APU = "/objects"`
-
-Фактический base path всех эндпоинтов: **`/api/v1/profitcontr/objects/objects`**.
-
-| Метод | URL | Назначение | Возврат |
-|---|---|---|---|
-| `GET` | `/api/v1/profitcontr/objects/objects/{contract-version-id}` | Поиск объектов по версии договора | `ResponseEntity<ObjectsDTO>` |
-| `POST` | `/api/v1/profitcontr/objects/objects` | Создание объекта | `ResponseEntity<ObjectsCreationResponse>` |
-
-Тело POST-запроса десериализуется в `ObjectCreateRequest` из
-`objects-rest-client/src/main/java/ru/sbrf/sbererp/profitcontr/objects/client/model/request/creation/ObjectCreateRequest.java`.
-
-### 1.2 Обязательные заголовки
-
-Контроллер принимает/возвращает сервисные заголовки (константы в `WebApplicationConstants.java`):
-
-| Header | Ключ (константа) | Где читается | Где в ответе |
-|---|---|---|---|
-| `request-id` | `REQUEST_ID_HEADER_KEY` (`UUID`, required) | `@RequestHeader` в обоих методах | отдаётся как `response-id`, равный входящему |
-| `correlation-id` | `CORRELATION_ID_HEADER_KEY` (`UUID`) | `@RequestHeader` | эхо-тируется в заголовок ответа |
-| `sberpdi` | `SBERPDI_HEADER_KEY` (`String`) | `@RequestHeader` | эхо-тируется в заголовок ответа |
-| `response-id` | `RESPONSE_ID_HEADER_KEY` | — | `.header(RESPONSE_ID_HEADER_KEY, requestId.toString())` |
-
-Дополнительно декларируется `IDEMPOTENCY_ID_HEADER_KEY = "idempotency-key"`, но в `ObjectController` он пока не читается (идемпотентность POST не реализована в контроллере).
-
-**Важно про scan «07_api.sberpdi_header» (count=0):** заголовок `sberpdi` фактически реализован и обязателен. Сканер ищет литерал `"sberpdi"` по raw-строке в контроллерах, а здесь значение задано константой `SBERPDI_HEADER_KEY = "sberpdi"` в `WebApplicationConstants.java` и используется через имя константы, поэтому raw-строка в контроллерах отсутствует → ложное срабатывание. Подтверждение: `@RequestHeader(value = SBERPDI_HEADER_KEY)` в `ObjectController` и `@Header(name = SBERPDI_HEADER_KEY, required = true)` в `ObjectControllerDocs`.
-
-### 1.3 OpenAPI / Swagger (springdoc)
-
-Зависимость `org.springdoc:springdoc-openapi-starter-webmvc-ui` — `objects/pom.xml` (строки 69–70). Swagger-документация вынесена в слой
-`objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/controller/swagger/ObjectControllerDocs.java`
-как **кастомные аннотации-интерфейсы** (`@interface`) с `@Target(ElementType.METHOD)`:
-- `ObjectControllerDocs.GetObjectByContractVersionIdDocs`
-- `ObjectControllerDocs.CreateObjectDocs`
-
-В них используются `@Operation`, `@Parameter`, `@ApiResponse`, `@Content`, `@Schema(implementation=...)`, `@ExampleObject(...)`, `@Header`. Методы контроллера помечены этими аннотациями вместо интерфейсов `*ControllerApi` (для rule 01 отмечено как локальное отклонение).
-
-Примеры тел запросов/ответов задаются строковыми константами `SUCCESS_EXAMPLE_GET_RESPONSE`, `REQUEST_OBJECT_EXAMPLE`, `SUCCESS_EXAMPLE_CREATE_RESPONSE`; каждый `@ApiResponse` объявляет `@Header` для `correlation-id`, `response-id`, `sberpdi`.
-
-### 1.4 DTO / request / response модели
-
-Все внешние модели — в модуле **`objects-rest-client`**, пакет `ru.sbrf.sbererp.profitcontr.objects.client.model`:
-- `dto/ObjectsDTO.java` — ответ GET;
-- `request/creation/*.java` — `ObjectCreateRequest`, `RentalObjectCreateRequest`, `AssetObjectCreateRequest`, `ConditionsCreateRequest`, `ReservationTermsCreateRequest`, `OrganisationCreateRequest`, `PartnerCreateRequest`;
-- `response/ObjectsCreationResponse.java` — ответ POST.
-
-Характерно: `@Schema(description=...)` на каждом свойстве, `@ArraySchema(maxItems=1000)`, алиасы полей через `@JsonProperty` (например `accountingSubjectDto` ↔ `organisation`, `dataServices` ↔ `services`), `@Builder`/`@Data`. `@JsonIgnoreProperties(ignoreUnknown = true)` присутствует **только** в `ObjectCreateRequest` (для rule 07 `json_ignore_unknown` — partial: остальные request/response DTO без него).
-
-### 1.5 Обработка ошибок
-
-`objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/exception/GlobalExceptionHandler.java` — `@RestControllerAdvice`, обрабатывает:
-- `EntityNotFoundException` → `404`
-- `ObjectTypeMismatchException` → `400`
-- `ObjectsAlreadyExistException` → `400`
-
-Во всех случаях возвращает `ErrorResponse` из внешней библиотеки `ru.sbrf.sbererp.profitcontr.utility2.model.response.ErrorResponse` (`new ErrorResponse(e.getMessage())`).
-
-### 1.6 Feign-клиент (objects-rest-client)
-
-`objects-rest-client/src/main/java/ru/sbrf/sbererp/profitcontr/objects/client/ObjectsClient.java` — `@FeignClient(name = "objects-client", configuration = SSLFeignClientConfiguration.class)`:
-- `POST /objects` — `createObjects`
-- `GET /objects/{contract-version-id}` — `getObjectsByContractVersionId`
-
-Оба метода принимают и пробрасывают заголовки `request-id`, `correlation-id`, `sberpdi`. Автоконфигурация — `ObjectsClientAutoConfiguration` (`@AutoConfiguration` + `@EnableFeignClients(basePackageClasses = ObjectsClient.class)`).
-
----
-
-<!-- source: auto -->
 ## 2. Соглашения для агента
 
-- Swagger-контракт описывай в `ru.sbrf.sbererp.profitcontr.objects.controller.swagger` через кастомные аннотации-интерфейсы (`@Target(ElementType.METHOD)`), которые навешиваешь на методы контроллера, — **не создавай** интерфейсы `*ControllerApi` (это принятый в репозитории стиль, что отмечено как локальное отклонение от `rules/01`).
-- Контроллер делай **тонким**: только `@RequestHeader` для `request-id`/`correlation-id`/`sberpdi`, `@Valid` для request body и делегирование в `service/object/…`; возвращай `ResponseEntity<T>` с `HttpStatus` и эхом сервисных заголовков (`response-id`, `correlation-id`, `sberpdi`).
-- Все request/response/DTO-модели размещай в модуле `objects-rest-client` в `client/model/{request,response,dto}` с `@Schema(description=...)`, `@JsonProperty`-алиасами и `@JsonIgnoreProperties(ignoreUnknown = true)` на входящих запросах для tolerant-десериализации.
-- Ошибки обрабатывай через `@RestControllerAdvice` (`GlobalExceptionHandler`) и возвращай `ErrorResponse` (`ru.sbrf.sbererp.profitcontr.utility2.model.response.ErrorResponse`); HTTP-статус задавай `@ResponseStatus`.
-- Сервисные заголовки задавай через константы `WebApplicationConstants.*_HEADER_KEY` (`objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/configuration/constants/WebApplicationConstants.java`), а не raw-строкой — единый источник истины и централизованное обновление.
+- Контроллер — тонкий: `@Valid` на теле запроса, обязательные заголовки через `@RequestHeader`, делегирование в сервис, статус ответа по семантике таблицы выше.
+- Ошибки — через `@RestControllerAdvice` + единый формат тела ошибки; не формируй тело ошибки вручную в каждом контроллере. Помимо обработчиков доменных исключений добавляй fallback-обработчик на `Exception.class`, возвращающий общий `500` без `e.getMessage()`/стектрейса в теле — полную информацию логируй через `log.error(..., e)`.
+- Request/response DTO — отдельные от JPA-сущностей классы; не отдавай entity напрямую наружу (утечка внутренней структуры БД в контракт, риск сериализации ленивых связей).
+- Документируй эндпоинт через `springdoc-openapi` аннотации (`@Operation`, `@ApiResponse`) на контроллере, через выделенный контракт-интерфейс, либо через кастомные составные (meta-)аннотации, сгруппированные в отдельном классе `{Controller}Docs` (каждая уже включает `@Operation`/`@ApiResponse`, вешается на метод контроллера вместо голого `@Operation`) — выбранный подход единый для всего сервиса.
+- Не убирай существующее обязательное поле из ответа и не меняй его тип без версионирования — это breaking change для потребителей; новое необязательное поле добавляй свободно, версия не нужна.
+- На новом мутирующем эндпоинте (`POST`/`PATCH` с побочным эффектом) — принимай `Idempotency-Key`, не откладывай это на потом как отдельную задачу (подробности реализации — `14_idempotency_rest.md`).
 
-<!-- source: auto -->
 ## 3. Чек-лист
 
-- [ ] Контроллер содержит `@Operation`-документацию через аннотации из `controller/swagger/…` (напр. `@ObjectControllerDocs.GetObjectByContractVersionIdDocs`)
-- [ ] Base path собран из констант `DEFAULT_URL_PREFIX_API` + `OBJECTS_URL_PREFIX_APU` (`/api/v1/profitcontr/objects/objects`)
-- [ ] Обязательные заголовки `request-id`, `correlation-id`, `sberpdi` принимаются и пробрасываются, отдаётся `response-id`
-- [ ] Request body на POST отмечен `@Valid`; на DTO заданы `@JsonProperty`-алиасы для сервисных имён полей
-- [ ] Входящие request DTO имеют `@JsonIgnoreProperties(ignoreUnknown = true)` для tolerant-десериализации
-- [ ] Ошибки — через `GlobalExceptionHandler` с HTTP-статусом и `ErrorResponse`
-- [ ] OpenAPI/springdoc перегенерируется при изменении сигнатур метода/DTO без ручной правки спецификации
-- [ ] Примеры тел (`@ExampleObject`) в `ObjectControllerDocs` актуальны JSON
+- [ ] URL — kebab-case существительные, HTTP-метод отражает действие
+- [ ] Один контроллер — один ресурс (без god-контроллеров); методы названы по действию (`getById`/`create`/`update`/`delete`/`list`), не по HTTP-глаголу
+- [ ] HTTP-статус соответствует семантике результата
+- [ ] Ошибки — единый формат на весь API (RFC 7807 или согласованный аналог)
+- [ ] Валидация входа — через Bean Validation, а не ручные проверки в контроллере
+- [ ] Request/response DTO отделены от JPA-сущностей
+- [ ] Входящие DTO толерантны к неизвестным полям
+- [ ] Списковые эндпоинты — пагинированы
+- [ ] Breaking change — только через новую версию/deprecation, не в текущем контракте
+- [ ] Корреляционные заголовки (`X-Request-Id`/`traceparent`) принимаются и пробрасываются дальше
+- [ ] Непредвиденные (недоменные) исключения не отдают клиенту `message`/стектрек — только общий статус, детали в логе
+- [ ] Мутирующие эндпоинты с побочным эффектом (`POST`/`PATCH`) принимают `Idempotency-Key`
+- [ ] OpenAPI-документация соответствует фактическим сигнатурам
 
-<!-- source: auto -->
-## 4. Примеры из кода
-
-### Example 1: ObjectController.java
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/controller/ObjectController.java`
+## 4. Примеры кода
 
 ```java
 @RestController
-@RequestMapping(DEFAULT_URL_PREFIX_API + OBJECTS_URL_PREFIX_APU)
-public class ObjectController {
-    @ObjectControllerDocs.GetObjectByContractVersionIdDocs
-    @GetMapping("/{contract-version-id}")
-    public ResponseEntity<ObjectsDTO> getObjectByContractVersionId(
-            @PathVariable("contract-version-id") UUID contractVersionId,
-            @RequestHeader(REQUEST_ID_HEADER_KEY) UUID requestId,
-            @RequestHeader(CORRELATION_ID_HEADER_KEY) UUID correlationId,
-            @RequestHeader(SBERPDI_HEADER_KEY) String sberId) {
-        return ResponseEntity.status(HttpStatus.OK)
-                .header(RESPONSE_ID_HEADER_KEY, requestId.toString())
-                .header(CORRELATION_ID_HEADER_KEY, correlationId.toString())
-                .header(SBERPDI_HEADER_KEY, sberId)
-                .body(serviceService.getServiceByContractVersionId(contractVersionId, requestId));
+@RequestMapping("/api/v1/orders")
+@RequiredArgsConstructor
+public class OrderController {
+
+    @PostMapping
+    public ResponseEntity<OrderResponse> createOrder(
+            @RequestBody @Valid OrderCreateRequest request,
+            @RequestHeader(REQUEST_ID_HEADER) UUID requestId) {
+        var response = orderService.createOrder(request);
+        return ResponseEntity
+                .created(URI.create("/api/v1/orders/" + response.id()))
+                .body(response);
     }
 }
 ```
 
-### Example 2: ObjectControllerDocs.java (Swagger-аннотации)
-**Путь:** `objects/src/main/java/ru/sbrf/sbererp/profitcontr/objects/controller/swagger/ObjectControllerDocs.java`
+Альтернатива документированию голыми `@Operation` — составные аннотации в отдельном классе `{Controller}Docs`:
 
 ```java
-@Operation(
-        summary = "Получение объектов по идентификатору версии договора",
-        parameters = @Parameter(name = "contract-version-id", required = true, example = CONTRACT_VERSION_ID_EXAMPLE),
-        responses = @ApiResponse(
-                responseCode = "200",
-                content = @Content(mediaType = MediaType.APPLICATION_JSON_VALUE,
-                        schema = @Schema(implementation = ObjectsResponse.class)),
-                headers = {
-                        @Header(name = CORRELATION_ID_HEADER_KEY, required = true),
-                        @Header(name = RESPONSE_ID_HEADER_KEY, required = true),
-                        @Header(name = SBERPDI_HEADER_KEY, required = true)
-                }))
-@Target(ElementType.METHOD)
-public @interface GetObjectByContractVersionIdDocs { ... }
-```
+public final class OrderControllerDocs {
+    private OrderControllerDocs() {
+    }
 
-### Example 3: request DTO с tolerant-десериализацией
-**Путь:** `objects-rest-client/src/main/java/ru/sbrf/sbererp/profitcontr/objects/client/model/request/creation/ObjectCreateRequest.java`
-
-```java
-@Data @Builder @NoArgsConstructor @AllArgsConstructor
-@JsonIgnoreProperties(ignoreUnknown = true)
-public class ObjectCreateRequest {
-    @Schema(description = "Идентификатор договора")
-    private UUID contractId;
-
-    @ArraySchema(schema = @Schema(description = "Услуги"), maxItems = 1000)
-    @JsonProperty("dataServices")
-    private List<DataService> services;
+    @Target(ElementType.METHOD)
+    @Retention(RetentionPolicy.RUNTIME)
+    @Operation(summary = "Создать заказ")
+    public @interface Create {
+    }
 }
 ```
 
----
+```java
+@OrderControllerDocs.Create
+@PostMapping
+public ResponseEntity<OrderResponse> create(@RequestBody @Valid OrderCreateRequest request) { ... }
+```
 
-<!-- source: auto -->
-## 5. Исключения и оговорки
+```java
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
 
-- Заголовок `sberpdi` реализован через константу и в коде фактически присутствует (scan count=0 — артефакт поиска по raw-строке). НЕ создавай «дублирующий» raw-string параметр ради прохождения проверки.
-- `idempotency-key` задекларирован в константах, но в `ObjectController` не обрабатывается — идемпотентность POST требует отдельной доработки (см. `rules/14_idempotency_rest.md`).
-- Base path — `/api/v1/profitcontr/objects/objects` (повтор сегмента `objects/objects` из-за склейки `DEFAULT_URL_PREFIX_API` и `OBJECTS_URL_PREFIX_APU`); при изменении пути правь обе константы согласованно.
-- Интерфейсы `*ControllerApi` не используются: Swagger-слой через кастомные аннотации — намеренный стиль репо (rule 07 и rule 01 отмечены как локальные отклонения).
+    @ExceptionHandler(OrderAlreadyExistsException.class)
+    public ProblemDetail handleConflict(OrderAlreadyExistsException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, e.getMessage());
+    }
 
----
+    @ExceptionHandler(EntityNotFoundException.class)
+    public ProblemDetail handleNotFound(EntityNotFoundException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
+    }
 
-<!-- source: auto -->
-## 6. Обновление
+    @ExceptionHandler(Exception.class)
+    public ProblemDetail handleUnexpected(Exception e) {
+        log.error("Unexpected error", e);
+        return ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR, "Внутренняя ошибка сервера");
+    }
+}
+```
 
-Пересоберите документ при изменении сигнатур контроллера/dto, base path, добавлении новых эндпоинтов или смене версии springdoc в `objects/pom.xml`.
+```java
+@JsonIgnoreProperties(ignoreUnknown = true)
+public record OrderCreateRequest(
+        @NotNull UUID customerId,
+        @NotEmpty List<@Valid OrderLineRequest> lines
+) {}
+```
+
+## 5. Когда пересматривать
+
+При изменении стратегии версионирования API, смене формата ошибок, появлении публичных внешних потребителей, требующих более строгих гарантий обратной совместимости, либо при обнаружении утечки внутренних деталей ошибки (сообщение исключения, стектрейс) в ответе API наружу.
