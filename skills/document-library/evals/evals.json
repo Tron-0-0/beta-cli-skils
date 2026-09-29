@@ -1,0 +1,53 @@
+{
+  "skill_name": "document-library",
+  "evals": [
+    {
+      "id": 1,
+      "name": "lanterna",
+      "prompt": "Разберись с библиотекой Lanterna, которую использует этот проект, и объясни, как ей пользоваться — на что обращать внимание при работе с её API, как она устроена и как её используют в нашем UI-слое (consoleui/).",
+      "expected_output": "specification/libraries/lanterna.md с реальными примерами из consoleui/ (не выдуманными), объяснением внутренней механики (терминальный буфер/экран, цикл отрисовки, обработка ввода), и specification/libraries/index.md со строкой про lanterna.",
+      "files": [],
+      "expectations": [
+        "Создан файл specification/libraries/lanterna.md",
+        "Файл начинается со строки '> Актуально на:'",
+        "Есть раздел 'Назначение'",
+        "Есть раздел про внутреннюю механику ('Внутренняя механика')",
+        "Есть раздел 'Как использовать'",
+        "Есть раздел про нюансы/грабли",
+        "Примеры использования ссылаются на реальные файлы проекта в consoleui/, а не выдуманы",
+        "Указана Maven-координата с groupId com.googlecode.lanterna",
+        "specification/libraries/index.md создан и содержит строку про lanterna"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "liquibase",
+      "prompt": "Мне нужно разобраться, как работает Liquibase — библиотека для миграций, которую мы используем. Объясни, как она устроена внутри и как мы её используем в этом проекте.",
+      "expected_output": "specification/libraries/liquibase-core.md, отражающий узкое использование (только миграции при старте, changelog в src/main/resources/db/changelog/), без выдумывания более широкого применения.",
+      "files": [],
+      "expectations": [
+        "Создан файл specification/libraries/liquibase-core.md (именно с суффиксом -core, а не liquibase.md)",
+        "Файл начинается со строки '> Актуально на:'",
+        "Указан корректный artifactId liquibase-core",
+        "Есть раздел про внутреннюю механику (changeset/changelog)",
+        "Упомянут реальный путь src/main/resources/db/changelog в проекте",
+        "Использование в проекте описано как узкое (только миграции при старте), без преувеличения",
+        "specification/libraries/index.md обновлён строкой про liquibase-core"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "docker-java",
+      "prompt": "В pom.xml подключена библиотека docker-java, но я не помню, зачем мы её добавляли и как её использовать. Разберись, пожалуйста.",
+      "expected_output": "specification/libraries/docker-java.md, честно фиксирующий, что библиотека подключена, но нигде не импортируется в src/main/java (только пустой DockerConfiguration.java как задел) — без выдумывания несуществующего использования.",
+      "files": [],
+      "expectations": [
+        "Создан файл specification/libraries/docker-java.md",
+        "Файл начинается со строки '> Актуально на:'",
+        "Явно зафиксировано, что библиотека не используется в src/main/java (только пустой класс DockerConfiguration как задел)",
+        "Раздел 'Как использовать' не выдаёт общую документацию библиотеки за факт текущего использования в проекте",
+        "specification/libraries/index.md обновлён строкой про docker-java"
+      ]
+    }
+  ]
+}
