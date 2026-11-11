@@ -45,11 +45,11 @@ description: Восьмой шаг пайплайна разработки — �
    ```
    Это первое и единственное место пайплайна, где тесты вообще запускаются — падения чинятся здесь же итеративно, не переносятся на следующие шаги.
 
-6. Запиши `$TASK_DIR/write-tests-report.md` по шаблону ниже.
+6. Запиши `$TASK_DIR/write-tests-report.md` по шаблону ниже. Файл начинается с frontmatter с тегом `increment`, при первом создании добавь его строкой в `$TASK_DIR/index.md` — по [`17-specification-files.md`](../../rules/17-specification-files.md).
 
 7. Спроси пользователя, завершён ли шаг (например: «Тесты написаны и проходят, коммитим?»). При отрицательном ответе — не коммитить, продолжить правки и спросить повторно. При положительном — обнови `$TASK_DIR/pipeline-state.md` (`write-tests` → `завершён`, `Текущий шаг` → `update-spec`) и закоммить тестовые файлы вместе с отчётом и состоянием одним коммитом:
    ```bash
-   git add <тестовый_файл1> <тестовый_файл2> ... "$TASK_DIR/write-tests-report.md" "$TASK_DIR/pipeline-state.md"
+   git add <тестовый_файл1> <тестовый_файл2> ... "$TASK_DIR/write-tests-report.md" "$TASK_DIR/pipeline-state.md" "$TASK_DIR/index.md"
    git commit -m "$(cat <<'EOF'
    Add tests: <короткое имя задачи>
 

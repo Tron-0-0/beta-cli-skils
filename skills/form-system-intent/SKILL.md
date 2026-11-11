@@ -28,7 +28,7 @@ description: Второй шаг пайплайна разработки — п�
 
 3. Если в `$TASK_DIR/system-intent.md` уже есть файл — покажи пользователю его текущее содержимое и спроси, обновляем ли мы существующий анализ (например, потому что `intent.md` менялся) или это нужно переделать с нуля.
 
-4. Прочитай сначала [`specification/README.md`](../../../specification/README.md), затем из документов, относящихся к системному уровню, читай те, что реально касаются идеи из `intent.md`:
+4. Прочитай сначала [`specification/index.md`](../../../specification/index.md), затем из документов, относящихся к системному уровню, читай те, что реально касаются идеи из `intent.md`:
    - [`architecture.md`](../../../specification/absolut/architecture.md) — общая картина устройства системы (на уровне "что за чем идёт и почему", не на уровне классов).
    - [`interactions.md`](../../../specification/absolut/interactions.md) — существующие процессы/пайплайны и то, как компоненты взаимодействуют во времени — нужно, чтобы понять, куда встраивается новый процесс.
    - [`data-model.md`](../../../specification/absolut/data-model.md) — если идея касается данных/сущностей и связей между ними на концептуальном уровне.
@@ -46,11 +46,11 @@ description: Второй шаг пайплайна разработки — п�
 
    Не задавай вопросы, ответ на которые уже очевиден из `intent.md`, из `specification/` или из кода. И не задавай вопросы уровня "в каком слое/классе это реализовать" — это забота `form-plan`, не этого шага.
 
-6. Запиши системный анализ в `$TASK_DIR/system-intent.md` строго по шаблону ниже.
+6. Запиши системный анализ в `$TASK_DIR/system-intent.md` строго по шаблону ниже. Файл начинается с frontmatter с тегом `increment`, при первом создании добавь его строкой в `$TASK_DIR/index.md` — по [`17-specification-files.md`](../../rules/17-specification-files.md).
 
 7. Спроси пользователя, завершён ли шаг (например: «Системный анализ готов, коммитим `system-intent.md`?»). При отрицательном ответе — не коммитить, продолжить правки и спросить повторно. При положительном — обнови `$TASK_DIR/pipeline-state.md` (`form-system-intent` → `завершён`, `Текущий шаг` → `form-plan`) и закоммить его вместе с `system-intent.md` на текущей (задачной) ветке, отдельным коммитом:
    ```bash
-   git add "$TASK_DIR/system-intent.md" "$TASK_DIR/pipeline-state.md"
+   git add "$TASK_DIR/system-intent.md" "$TASK_DIR/pipeline-state.md" "$TASK_DIR/index.md"
    git commit -m "$(cat <<'EOF'
    Add system intent: <короткое имя задачи>
 

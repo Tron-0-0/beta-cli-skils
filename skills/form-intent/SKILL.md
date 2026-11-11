@@ -37,13 +37,15 @@ description: Первый шаг пайплайна разработки — п�
    mkdir -p "$TASK_DIR"
    ```
 
-   Сразу после этого создай черновик `$TASK_DIR/pipeline-state.md` (формат — см. [`pipeline-status/SKILL.md`](../pipeline-status/SKILL.md#формат-pipeline-statemd)): все 10 шагов — `не начат`, кроме `1. form-intent` — `в процессе`; `## Текущий шаг` — `form-intent`. Файл на этом этапе не коммитится — коммитится на шаге 6 вместе с `intent.md`.
+   Вместе с папкой создай её `$TASK_DIR/index.md` и добавь задачу в `specification/increment/$VERSION/index.md`. Если папки версии ещё не было — создай и её `index.md` и добавь версию в `specification/increment/index.md`. Теги и формат строк — по [`17-specification-files.md`](../../rules/17-specification-files.md).
+
+   Сразу после этого создай черновик `$TASK_DIR/pipeline-state.md` (формат — см. [`pipeline-status/SKILL.md`](../pipeline-status/SKILL.md#формат-pipeline-statemd)): все 10 шагов — `не начат`, кроме `1. form-intent` — `в процессе`; `## Текущий шаг` — `form-intent`. Файл на этом этапе не коммитится — коммитится на шаге 6 вместе с `intent.md`. У `pipeline-state.md` и `intent.md` тег `increment`, оба файла упомянуты в `$TASK_DIR/index.md`.
 
    Все следующие шаги пайплайна для этой же задачи (`form-system-intent`, `form-plan`, `execute-plan`, `run-quality-gate`, `align-with-rules`, `verify-implementation`, `write-tests`, `update-spec`) должны выполняться в этой же ветке, не переключаясь на `$INTEGRATION_BRANCH` и не создавая других веток, пока пайплайн не завершится — см. проверку ветки в начале каждого из этих скиллов.
 
 2. Если в `$TASK_DIR/intent.md` уже есть файл — покажи пользователю его текущее содержимое и спроси, обновляем ли мы существующее намерение или это новая, отдельная задача (тогда предложи сначала создать/переключиться на новую ветку — одна ветка = одно намерение).
 
-3. Прочитай сначала [`specification/README.md`](../../../specification/README.md) — это индекс с однострочным описанием каждого файла. Из документов, относящихся к бизнес-уровню, читай:
+3. Прочитай сначала [`specification/index.md`](../../../specification/index.md) — это индекс с однострочным описанием каждого файла. Из документов, относящихся к бизнес-уровню, читай:
    - [`business.md`](../../../specification/absolut/business.md) — бизнес-сущности, правила, текущий бизнес-статус, открытые вопросы.
    - [`ideas.md`](../../../specification/ideas.md) — уже согласованный бэклог/направления развития (вдруг эта идея там уже упомянута или явно противоречит ранее принятому решению).
 
@@ -69,7 +71,7 @@ description: Первый шаг пайплайна разработки — п�
 
 6. Спроси пользователя, завершён ли шаг (например: «Намерение готово, коммитим `intent.md`?»). При отрицательном ответе — не коммитить, продолжить правки и спросить повторно, когда пользователь скажет, что готово. При положительном — обнови `$TASK_DIR/pipeline-state.md` (`form-intent` → `завершён`, `Текущий шаг` → `form-system-intent`) и закоммить его вместе с `intent.md` на текущей (задачной) ветке, отдельным коммитом, не затрагивая остальные незакоммиченные изменения в рабочей директории:
    ```bash
-   git add "$TASK_DIR/intent.md" "$TASK_DIR/pipeline-state.md"
+   git add "$TASK_DIR/intent.md" "$TASK_DIR/pipeline-state.md" "$TASK_DIR/index.md" specification/increment/index.md "specification/increment/$VERSION/index.md"
    git commit -m "$(cat <<'EOF'
    Add intent: <короткое имя задачи>
 

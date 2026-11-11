@@ -37,11 +37,11 @@ description: Четвёртый шаг пайплайна разработки �
    ```
    Зафиксируй результат (успех/ошибки) в отчёте — только сборку/компиляцию, тесты на этом шаге не прогоняются.
 
-6. Запиши `$TASK_DIR/execution-report.md` по шаблону ниже.
+6. Запиши `$TASK_DIR/execution-report.md` по шаблону ниже. Файл начинается с frontmatter с тегом `increment`, при первом создании добавь его строкой в `$TASK_DIR/index.md` — по [`17-specification-files.md`](../../rules/17-specification-files.md).
 
 7. Если сборка из шага 5 зелёная — спроси пользователя, завершён ли шаг (например: «Реализация готова, коммитим?»). При отрицательном ответе — не коммитить, продолжить правки и спросить повторно, когда пользователь скажет, что готово. При положительном — обнови `$TASK_DIR/pipeline-state.md` (`execute-plan` → `завершён`, `Текущий шаг` → `run-quality-gate`) и закоммить изменённые/созданные файлы задачи плюс `execution-report.md` и `pipeline-state.md` (по образцу коммита `intent.md` в [`form-intent/SKILL.md`](../form-intent/SKILL.md), шаг 6 там): `git add` только по списку конкретных файлов (не `-A`), сообщение:
    ```bash
-   git add <файл1> <файл2> ... "$TASK_DIR/execution-report.md" "$TASK_DIR/pipeline-state.md"
+   git add <файл1> <файл2> ... "$TASK_DIR/execution-report.md" "$TASK_DIR/pipeline-state.md" "$TASK_DIR/index.md"
    git commit -m "$(cat <<'EOF'
    Implement: <короткое имя задачи>
 

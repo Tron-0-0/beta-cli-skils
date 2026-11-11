@@ -43,11 +43,11 @@ description: Третий шаг пайплайна разработки — п�
 
 6. Если задача меняет схему БД — шаг с миграцией должен соответствовать правилу проекта для миграций из `.claude/rules/` (найди его по индексу `README.md` — обычно про Liquibase/Flyway: новый changeset, не редактирование существующих, формат имени файла и `--rollback`).
 
-7. Запиши план в `$TASK_DIR/plan.md` по шаблону ниже.
+7. Запиши план в `$TASK_DIR/plan.md` по шаблону ниже. Файл начинается с frontmatter с тегом `increment`, при первом создании добавь его строкой в `$TASK_DIR/index.md` — по [`17-specification-files.md`](../../rules/17-specification-files.md).
 
 8. Покажи план пользователю и явно спроси подтверждение — совмещённое с вопросом о завершении шага (например: «План устраивает, коммитим `plan.md`?»). Это та же точка, где дешевле всего поймать неверный подход, и точка коммита одновременно. При отрицательном ответе — не коммитить, доработать план по замечаниям и спросить снова. При положительном — обнови `$TASK_DIR/pipeline-state.md` (`form-plan` → `завершён`, `Текущий шаг` → `execute-plan`) и закоммить его вместе с `plan.md` отдельным коммитом, по аналогии с `intent.md` ([`form-intent/SKILL.md`](../form-intent/SKILL.md), шаг 6):
    ```bash
-   git add "$TASK_DIR/plan.md" "$TASK_DIR/pipeline-state.md"
+   git add "$TASK_DIR/plan.md" "$TASK_DIR/pipeline-state.md" "$TASK_DIR/index.md"
    git commit -m "$(cat <<'EOF'
    Add plan: <короткое имя задачи>
 
