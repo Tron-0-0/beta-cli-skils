@@ -1,0 +1,37 @@
+{
+  "bashEditDiffEnabled": true,
+  "permissions": {
+    "deny": [
+      "mcp__postgres__postgres_mcp_add_connection",
+      "mcp__postgres__postgres_mcp_bulk_load_csv",
+      "mcp__postgres__postgres_mcp_modify",
+      "mcp__postgres__postgres_mcp_remove_connection"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|Bash|mcp__agent-lsp__(apply_edit|safe_apply_edit|safe_edit|replace_symbol_body|insert_after_symbol|insert_before_symbol|safe_delete_symbol|rename_symbol|refactor)",
+        "hooks": [{"type": "command", "command": "~/.claude/hooks/agent-lsp/track-edit.sh", "timeout": 10}]
+      },
+      {
+        "matcher": "mcp__agent-lsp__get_diagnostics",
+        "hooks": [{"type": "command", "command": "~/.claude/hooks/agent-lsp/clear-checked.sh", "timeout": 10}]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [{"type": "mcp_tool", "server": "agent-lsp", "tool": "close_document",
+                   "input": {"file_path": "${tool_input.file_path}"}, "timeout": 10}]
+      }
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "~/.claude/hooks/agent-lsp/stop-gate.sh", "timeout": 10}]}
+    ],
+    "SubagentStop": [
+      {"hooks": [{"type": "command", "command": "~/.claude/hooks/agent-lsp/stop-gate.sh", "timeout": 10}]}
+    ],
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "python3 -I ~/.claude/hooks/agent-lsp/env-check.py", "timeout": 15}]}
+    ]
+  }
+}
